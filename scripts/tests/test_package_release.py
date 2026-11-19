@@ -89,6 +89,14 @@ class PackageTests(unittest.TestCase):
                 stream.extractall(folder)
         return next(folder.iterdir())
 
+    def archive_modes(self, archive):
+        """Permission bits of each file in the archive, keyed by path inside the package folder."""
+        if archive.name.endswith(".tar.gz"):
+            with tarfile.open(archive) as stream:
+                return {m.name.partition("/")[2]: m.mode & 0o777 for m in stream.getmembers() if m.isfile()}
+        with zipfile.ZipFile(archive) as stream:
+            return {i.filename.partition("/")[2]: (i.external_attr >> 16) & 0o777 for i in stream.infolist()}
+
     def test_all_platform_layouts_checksums_sources_and_secret_exclusion(self):
         for target, (platform, _) in package_release.TARGETS.items():
             with self.subTest(target=target):
@@ -109,9 +117,16 @@ class PackageTests(unittest.TestCase):
                     with (folder / "CodeBot.app/Contents/Info.plist").open("rb") as stream:
                         self.assertEqual(plistlib.load(stream)["CFBundleExecutable"], "codebot-gui")
                     self.assertTrue((folder / "CodeBot.app/Contents/MacOS/codebot-cli").is_file())
-                if platform == "linux":
-                    self.assertTrue((folder / "CodeBot.sh").stat().st_mode & 0o111)
-                    self.assertTrue((folder / "bin/codebot-cli").stat().st_mode & 0o111)
+                # Check the permissions stored in the archive: they are what ships,
+                # and they do not depend on the filesystem that runs the test.
+                modes = self.archive_modes(archive)
+                executables = {"linux": ["CodeBot.sh", "bin/codebot-gui", "bin/codebot-cli"],
+                               "macos": ["bin/codebot-cli", "CodeBot.app/Contents/MacOS/codebot-gui",
+                                         "CodeBot.app/Contents/MacOS/codebot-cli"]}.get(platform, [])
+                for relative in executables:
+                    self.assertEqual(modes[relative], 0o755, relative)
+                readme = "CodeBot.app/Contents/Resources/readme.md" if platform == "macos" else "readme.md"
+                self.assertEqual(modes[readme], 0o644)
 
     def test_license_gate_never_picks_a_license_and_public_archives_require_release(self):
         target = "x86_64-unknown-linux-gnu"

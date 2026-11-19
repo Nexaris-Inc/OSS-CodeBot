@@ -196,14 +196,33 @@ def package(root, binaries, out, target, profile, development, report, metadata)
         (stage / "package-manifest.json").write_text(json.dumps({"version": version, "target": target,
             "profile": profile, "development": development, "commit": commit, "source_dirty": source_dirty, "files": files}, indent=2) + "\n", encoding="utf-8")
         temporary_archive = Path(temp) / ("archive" + extension)
+        # Record permissions explicitly instead of copying them from the build
+        # filesystem: Windows cannot store the executable bit, which would ship
+        # Linux/macOS binaries and the launcher without it.
+        executables = {"linux": {"bin/codebot-gui", "bin/codebot-cli", "CodeBot.sh"},
+                       "macos": {"bin/codebot-cli", "CodeBot.app/Contents/MacOS/codebot-gui",
+                                 "CodeBot.app/Contents/MacOS/codebot-cli"}}.get(platform, set())
+
+        def file_mode(relative):
+            return 0o755 if relative in executables else 0o644
+
         if platform == "linux":
+            def normalize(info):
+                relative = info.name.partition("/")[2]
+                info.mode = 0o755 if info.isdir() else file_mode(relative)
+                return info
+
             with tarfile.open(temporary_archive, "w:gz") as stream:
-                stream.add(stage, arcname=name)
+                stream.add(stage, arcname=name, filter=normalize)
         else:
             with zipfile.ZipFile(temporary_archive, "w", zipfile.ZIP_DEFLATED) as stream:
                 for path in sorted(stage.rglob("*")):
                     if path.is_file():
-                        stream.write(path, path.relative_to(stage.parent))
+                        relative = path.relative_to(stage).as_posix()
+                        info = zipfile.ZipInfo.from_file(path, path.relative_to(stage.parent))
+                        info.compress_type = zipfile.ZIP_DEFLATED
+                        info.external_attr = (0o100000 | file_mode(relative)) << 16
+                        stream.writestr(info, path.read_bytes())
         digest = sha256(temporary_archive)
         created_archive = False
         try:
