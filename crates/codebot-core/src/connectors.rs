@@ -413,39 +413,68 @@ pub fn call_connector_tool(
     })
 }
 
-#[cfg(all(test, unix))]
+#[cfg(test)]
 mod tests {
     use super::*;
 
-    /// A tiny MCP server written as a shell script, enough to exercise the protocol.
-    fn server(dir: &Path, body: &str) -> ConnectorConfig {
-        let path = dir.join("server.sh");
+    /// A Python interpreter, so the fake servers run on every CI platform.
+    fn python() -> Option<String> {
+        ["python3", "python"]
+            .into_iter()
+            .map(str::to_owned)
+            .find(|name| {
+                Command::new(name)
+                    .arg("-c")
+                    .arg("import sys; sys.exit(0 if sys.version_info >= (3, 8) else 1)")
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
+                    .status()
+                    .is_ok_and(|s| s.success())
+            })
+    }
+    /// A small MCP server script, enough to exercise the protocol.
+    fn server(dir: &Path, body: &str) -> Option<ConnectorConfig> {
+        let Some(python) = python() else {
+            eprintln!("skipping connector test: Python 3 is not installed");
+            return None;
+        };
+        let path = dir.join("server.py");
         std::fs::write(&path, body).unwrap();
-        ConnectorConfig {
+        Some(ConnectorConfig {
             name: "fake".into(),
-            command: "/bin/sh".into(),
-            args: vec![path.to_string_lossy().into_owned()],
+            command: python,
+            args: vec!["-u".into(), path.to_string_lossy().into_owned()],
             env_names: vec!["CODEBOT_TEST_VALUE".into()],
-            timeout_seconds: 5,
-        }
+            timeout_seconds: 10,
+        })
     }
     const SERVER: &str = r#"
-while IFS= read -r line; do
-  id=$(printf '%s' "$line" | sed -n 's/.*"id":\([0-9]*\).*/\1/p')
-  case "$line" in
-    *'"initialize"'*) printf '{"jsonrpc":"2.0","method":"notifications/message","params":{}}\n'
-      printf '{"jsonrpc":"2.0","id":99,"method":"ping"}\n'
-      printf '{"jsonrpc":"2.0","id":%s,"result":{"protocolVersion":"2025-06-18","capabilities":{"tools":{}},"serverInfo":{"name":"fake","version":"1"}}}\n' "$id" ;;
-    *'"tools/list"'*) printf '{"jsonrpc":"2.0","id":%s,"result":{"tools":[{"name":"echo.env","description":"Echo","inputSchema":{"type":"object","properties":{"x":{"type":"string"}}}},{"name":"bad name"}]}}\n' "$id" ;;
-    *'"tools/call"'*) printf '{"jsonrpc":"2.0","id":%s,"result":{"content":[{"type":"text","text":"value=%s home=%s"},{"type":"image","data":"AA=="}],"isError":false}}\n' "$id" "$CODEBOT_TEST_VALUE" "${CODEBOT_SECRET:-unset}" ;;
-  esac
-done
+import json, os, sys
+def send(message):
+    sys.stdout.write(json.dumps(message) + "\n")
+    sys.stdout.flush()
+for line in sys.stdin:
+    request = json.loads(line)
+    method, rid = request.get("method"), request.get("id")
+    if method == "initialize":
+        send({"jsonrpc": "2.0", "method": "notifications/message", "params": {}})
+        send({"jsonrpc": "2.0", "id": 99, "method": "ping"})
+        send({"jsonrpc": "2.0", "id": rid, "result": {"protocolVersion": "2025-06-18", "capabilities": {"tools": {}}, "serverInfo": {"name": "fake", "version": "1"}}})
+    elif method == "tools/list":
+        send({"jsonrpc": "2.0", "id": rid, "result": {"tools": [
+            {"name": "echo.env", "description": "Echo", "inputSchema": {"type": "object", "properties": {"x": {"type": "string"}}}},
+            {"name": "bad name"}]}})
+    elif method == "tools/call":
+        text = "value=%s home=%s" % (os.environ.get("CODEBOT_TEST_VALUE", "unset"), os.environ.get("CODEBOT_SECRET", "unset"))
+        send({"jsonrpc": "2.0", "id": rid, "result": {"content": [{"type": "text", "text": text}, {"type": "image", "data": "AA=="}], "isError": False}})
 "#;
 
     #[test]
     fn lists_and_calls_tools_with_only_allowed_environment() {
         let dir = tempfile::tempdir().unwrap();
-        let config = server(dir.path(), SERVER);
+        let Some(config) = server(dir.path(), SERVER) else {
+            return;
+        };
         std::env::set_var("CODEBOT_TEST_VALUE", "visible");
         std::env::set_var("CODEBOT_SECRET", "hidden");
         let cancel = AtomicBool::new(false);
@@ -455,8 +484,8 @@ done
         let output =
             call_connector_tool(&config, None, "echo.env", &json!({"x":"1"}), &cancel).unwrap();
         assert!(!output.is_error);
-        assert!(output.text.contains("value=visible"));
-        assert!(output.text.contains("home=unset"));
+        assert!(output.text.contains("value=visible"), "{}", output.text);
+        assert!(output.text.contains("home=unset"), "{}", output.text);
         assert!(output.text.contains("[imageの内容は省略しました]"));
         assert!(call_connector_tool(&config, None, "echo.env", &json!([1]), &cancel).is_err());
     }
@@ -464,20 +493,23 @@ done
     #[test]
     fn timeouts_errors_and_invalid_configs_are_reported() {
         let dir = tempfile::tempdir().unwrap();
-        let mut silent = server(dir.path(), "sleep 30\n");
+        let Some(mut silent) = server(dir.path(), "import time\ntime.sleep(30)\n") else {
+            return;
+        };
         silent.timeout_seconds = 1;
         let started = Instant::now();
         let error = list_connector_tools(&silent, None, &AtomicBool::new(false)).unwrap_err();
         assert!(error.contains("時間内"), "{error}");
-        assert!(started.elapsed() < Duration::from_secs(5));
+        assert!(started.elapsed() < Duration::from_secs(8));
 
         let cancelled = list_connector_tools(&silent, None, &AtomicBool::new(true)).unwrap_err();
         assert!(cancelled.contains("中止"));
 
         let failing = server(
             dir.path(),
-            r#"read -r line; printf '{"jsonrpc":"2.0","id":1,"error":{"code":-1,"message":"boom"}}\n'"#,
-        );
+            "import sys\nsys.stdin.readline()\nprint('{\"jsonrpc\":\"2.0\",\"id\":1,\"error\":{\"code\":-1,\"message\":\"boom\"}}', flush=True)\nsys.stdin.read()\n",
+        )
+        .unwrap();
         assert!(
             list_connector_tools(&failing, None, &AtomicBool::new(false))
                 .unwrap_err()
@@ -512,7 +544,7 @@ done
         }
         let missing = ConnectorConfig {
             name: "missing".into(),
-            command: "/nonexistent/codebot-mcp".into(),
+            command: "codebot-nonexistent-mcp-server".into(),
             ..Default::default()
         };
         assert!(list_connector_tools(&missing, None, &AtomicBool::new(false)).is_err());

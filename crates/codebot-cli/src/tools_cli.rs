@@ -38,13 +38,63 @@ pub(super) fn run(args: &Args) -> Result<(), String> {
     let config = codebot_core::Config::load(args.config.as_deref())?;
     let backend =
         codebot_core::Backend::from_id(&config.provider).ok_or("APIサービスを選択してください")?;
-    let mut conversation = ToolConversation::new(
-        &config,
+    let workspace = args.workspace.as_deref().unwrap();
+    let skills = codebot_core::resolve_skills(&args.skills, Some(workspace))?;
+    let mut messages = vec![ChatMessage::user(args.input.clone().unwrap())];
+    codebot_core::prepend_skills(&config, &mut messages, &skills)?;
+    // Wider input limit for the skill text; the total stays within the context budget.
+    let mut limits = config.clone();
+    limits.max_input_chars = limits
+        .max_input_chars
+        .saturating_add(codebot_core::skill_preamble(&skills).chars().count());
+    let connectors = args
+        .connectors
+        .iter()
+        .map(|name| {
+            config
+                .connectors
+                .iter()
+                .find(|c| &c.name == name)
+                .cloned()
+                .ok_or_else(|| {
+                    format!("コネクター「{name}」が設定ファイルの [[connectors]] にありません")
+                })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let cancel = Arc::new(AtomicBool::new(false));
+    let signal = cancel.clone();
+    ctrlc::set_handler(move || signal.store(true, Ordering::Relaxed))
+        .map_err(|_| "Ctrl+Cを準備できません")?;
+    let mut tools = Vec::new();
+    for connector in &connectors {
+        eprintln!(
+            "コネクター「{}」に接続してツールを確認しています…",
+            connector.name
+        );
+        let listed = codebot_core::list_connector_tools(connector, Some(workspace), &cancel)
+            .map_err(|e| format!("コネクター「{}」：{e}", connector.name))?;
+        eprintln!(
+            "  ツール {}件: {}",
+            listed.len(),
+            listed
+                .iter()
+                .map(|t| t.name.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+        tools.extend(listed);
+    }
+    for skill in &skills {
+        eprintln!("スキル: {}（{}）", skill.name, skill.source.label());
+    }
+    let mut conversation = ToolConversation::with_connectors(
+        &limits,
         backend,
         &config.api,
         None,
-        &[ChatMessage::user(args.input.clone().unwrap())],
-        args.workspace.as_deref().unwrap(),
+        &messages,
+        workspace,
+        &tools,
     )?;
     let resolved = config.api.resolved(backend);
     println!(
@@ -54,10 +104,6 @@ pub(super) fn run(args: &Args) -> Result<(), String> {
         resolved.protocol.label(),
         conversation.root().display()
     );
-    let cancel = Arc::new(AtomicBool::new(false));
-    let signal = cancel.clone();
-    ctrlc::set_handler(move || signal.store(true, Ordering::Relaxed))
-        .map_err(|_| "Ctrl+Cを準備できません")?;
     loop {
         let reply = conversation.request(&cancel)?;
         for event in &reply.events {
@@ -74,12 +120,22 @@ pub(super) fn run(args: &Args) -> Result<(), String> {
             call.id,
             serde_json::to_string_pretty(&call.arguments).unwrap()
         );
-        let result = execute_proposal(
-            call,
-            conversation.root(),
-            args.tools_journal_dir.as_deref(),
-            &cancel,
-        )?;
+        let result = match conversation.connector_call(call) {
+            Some(found) => {
+                let (tool, arguments) = found?;
+                let connector = connectors
+                    .iter()
+                    .find(|c| c.name == tool.connector)
+                    .ok_or("コネクターの設定が見つかりません")?;
+                execute_connector(connector, &tool, &arguments, conversation.root(), &cancel)?
+            }
+            None => execute_proposal(
+                call,
+                conversation.root(),
+                args.tools_journal_dir.as_deref(),
+                &cancel,
+            )?,
+        };
         println!(
             "AIへ送る結果：\n{}",
             serde_json::to_string_pretty(&result).unwrap()
@@ -96,6 +152,61 @@ pub(super) fn run(args: &Args) -> Result<(), String> {
     }
 }
 
+/// Show a connector tool call and run it only after the user types `run`.
+fn execute_connector(
+    connector: &codebot_core::ConnectorConfig,
+    tool: &codebot_core::ConnectorTool,
+    arguments: &serde_json::Value,
+    root: &std::path::Path,
+    cancel: &AtomicBool,
+) -> Result<ToolResult, String> {
+    println!(
+        "コネクター「{}」のツール「{}」\n起動するプログラム：{} {}\n作業場所：{}\n追加の環境変数：{}\nタイムアウト：{}秒",
+        connector.name,
+        tool.name,
+        connector.command,
+        connector.args.join(" "),
+        root.display(),
+        if connector.env_names.is_empty() { "なし".into() } else { connector.env_names.join(", ") },
+        connector.timeout_seconds
+    );
+    if !confirm("run", cancel)? {
+        return Ok(ToolResult {
+            status: ToolStatus::Rejected,
+            summary: "利用者がコネクターツールの実行を拒否しました。実行していません。".into(),
+        });
+    }
+    Ok(
+        match codebot_core::call_connector_tool(
+            connector,
+            Some(root),
+            &tool.name,
+            arguments,
+            cancel,
+        ) {
+            Ok(output) if output.is_error => ToolResult {
+                status: ToolStatus::Failed,
+                summary: format!("ツールがエラーを返しました。\n{}", output.text),
+            },
+            Ok(output) => ToolResult {
+                status: ToolStatus::Succeeded,
+                summary: if output.text.trim().is_empty() {
+                    "ツールは成功しました（出力なし）。".into()
+                } else {
+                    output.text
+                },
+            },
+            Err(_) if cancel.load(Ordering::Relaxed) => ToolResult {
+                status: ToolStatus::Cancelled,
+                summary: "利用者がコネクターツールの実行を停止しました。".into(),
+            },
+            Err(error) => ToolResult {
+                status: ToolStatus::Failed,
+                summary: error,
+            },
+        },
+    )
+}
 pub(super) fn execute_proposal(
     call: &codebot_core::ToolCall,
     root: &std::path::Path,

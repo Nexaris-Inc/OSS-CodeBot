@@ -1066,6 +1066,15 @@ impl App {
             budget,
         )
     }
+    /// (used, budget) when the next request uses 80% or more of the budget.
+    fn context_warning(&mut self) -> Option<(usize, usize)> {
+        if self.backend == Backend::Rules {
+            return None;
+        }
+        let (segments, budget) = self.context_segments();
+        let used = context_bar::used(&segments);
+        (used * 10 >= budget * 8).then_some((used, budget))
+    }
     /// Chips for skills and connectors attached to this chat.
     fn attached_chips(&mut self, ui: &mut egui::Ui) {
         let session = &mut self.sessions[self.active];
@@ -1327,6 +1336,38 @@ impl App {
                 }
             });
         });
+        if let Some((used, budget)) = self.context_warning() {
+            let pending = self.pending.is_some();
+            let session = &mut self.sessions[self.active];
+            ui.horizontal_wrapped(|ui| {
+                ui.label(
+                    RichText::new(if used > budget {
+                        "送信できる量（max_context_chars）を超えています。"
+                    } else {
+                        "コンテキストが上限の80%を超えました。"
+                    })
+                    .size(12.0)
+                    .color(if used > budget { ERROR } else { MUTED }),
+                );
+                if session.history_enabled && session.history.len() >= 2 {
+                    let others = used.saturating_sub(history_chars(&session.history));
+                    let allowed = (budget * 6 / 10).saturating_sub(others);
+                    if ui
+                        .add_enabled(!pending, egui::Button::new("古い履歴を外す"))
+                        .on_hover_text("送信用の履歴から古い往復を外し、使用量を60%以下にします。画面の会話は残ります。")
+                        .clicked()
+                    {
+                        let removed = trim_history(&mut session.history, allowed);
+                        session.notice = Some(format!(
+                            "送信用の履歴から古い{removed}往復を外しました。画面の会話は残っています。"
+                        ));
+                        self.sessions_dirty = true;
+                    }
+                } else if !session.attachments.is_empty() {
+                    ui.label(RichText::new("添付する行の範囲を狭めると減らせます。").size(12.0).color(MUTED));
+                }
+            });
+        }
         if self.backend != Backend::Rules {
             let destination = self.destination_key();
             ui.horizontal(|ui| {
@@ -2155,6 +2196,10 @@ impl eframe::App for App {
                             0.0
                         };
                         let extra = extra + self.sessions[self.active].attachments.len() as f32 * 26.0;
+                        let session = &self.sessions[self.active];
+                        let extra = extra
+                            + if session.skills.is_empty() && session.connectors.is_empty() { 0.0 } else { 40.0 }
+                            + if self.context_warning().is_some() { 36.0 } else { 0.0 };
                         let composer_top =
                             (bounds.bottom() - 108.0 - extra).max(bounds.top() + 80.0);
                         let history = egui::Rect::from_min_max(
@@ -2243,6 +2288,21 @@ fn text_area(text: &mut dyn egui::TextBuffer) -> egui::TextEdit<'_> {
     egui::TextEdit::multiline(text).margin(FIELD_MARGIN)
 }
 
+fn history_chars(history: &[ChatMessage]) -> usize {
+    history.iter().map(|m| m.content.chars().count()).sum()
+}
+
+/// Drop the oldest user/answer pairs until the history fits in `allowed`
+/// characters. Returns the number of pairs removed.
+fn trim_history(history: &mut Vec<ChatMessage>, allowed: usize) -> usize {
+    let mut removed = 0;
+    while history.len() >= 2 && history_chars(history) > allowed {
+        history.drain(..2);
+        removed += 1;
+    }
+    removed
+}
+
 /// Add the chat's skill instructions in front of the first request message.
 /// The input limit is widened by the instructions' size; the total stays within
 /// `max_context_chars`.
@@ -2252,16 +2312,7 @@ fn apply_skills(
     messages: &mut [ChatMessage],
 ) -> Result<(), String> {
     let skills = library::resolve_skills(&session.skills, session.workspace_root.as_deref())?;
-    let preamble = codebot_core::skill_preamble(&skills);
-    if preamble.is_empty() {
-        return Ok(());
-    }
-    messages[0].content.insert_str(0, &preamble);
-    let mut limits = config.clone();
-    limits.max_input_chars = limits
-        .max_input_chars
-        .saturating_add(preamble.chars().count());
-    validate_messages(&limits, messages).map_err(|e| format!("スキルを含めると送信できません：{e}"))
+    codebot_core::prepend_skills(config, messages, &skills)
 }
 
 /// Material input chip with a colored dot and a remove action.
@@ -2633,6 +2684,36 @@ fn main() -> eframe::Result {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn trimming_removes_whole_oldest_pairs_until_the_history_fits() {
+        let mut history = vec![
+            ChatMessage::user("a".repeat(40)),
+            ChatMessage::assistant("b".repeat(40)),
+            ChatMessage::user("c".repeat(10)),
+            ChatMessage::assistant("d".repeat(10)),
+        ];
+        assert_eq!(trim_history(&mut history, 50), 1);
+        assert_eq!(history.len(), 2);
+        assert_eq!(history[0].content, "c".repeat(10));
+        assert_eq!(trim_history(&mut history, 50), 0);
+        assert_eq!(trim_history(&mut history, 0), 1);
+        assert!(history.is_empty());
+    }
+    #[test]
+    fn the_near_limit_warning_follows_the_configured_budget() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = dir.path().join("config.toml");
+        std::fs::write(&config, "provider = \"openai\"\nmax_context_chars = 100\n").unwrap();
+        let mut app = App::default();
+        app.config_path = config.to_string_lossy().into_owned();
+        app.backend = Backend::Openai;
+        app.sessions[0].draft = "x".repeat(70);
+        assert!(app.context_warning().is_none());
+        app.sessions[0].draft = "x".repeat(85);
+        assert_eq!(app.context_warning(), Some((85, 100)));
+        app.backend = Backend::Rules;
+        assert!(app.context_warning().is_none());
+    }
     fn wait_for_restore(app: &mut App) {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         while app.poll_restore() {

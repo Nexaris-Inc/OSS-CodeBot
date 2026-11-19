@@ -491,6 +491,7 @@ dependencies = [
  "codebot-core",
  "ctrlc",
  "serde_json",
+ "tempfile",
 ]
 
 [[package]]

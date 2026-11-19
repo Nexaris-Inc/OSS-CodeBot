@@ -31,7 +31,7 @@ impl Segment {
     }
 }
 
-fn used(segments: &[Segment]) -> usize {
+pub fn used(segments: &[Segment]) -> usize {
     segments
         .iter()
         .filter(|s| s.note.is_none())

@@ -13,9 +13,9 @@ pub use plugins::{
     PluginManifest, PluginPermission, PluginRun, PreparedPluginInstall, PreparedPluginRemove,
 };
 pub use skills::{
-    default_skills_dir, import_skill, list_skills, parse_skill, read_skill, remove_skill,
-    skill_preamble, skill_sources, user_skills_dir, Skill, SkillSource, MAX_ATTACHED_SKILLS,
-    MAX_SKILL_BODY_CHARS,
+    default_skills_dir, import_skill, list_skills, parse_skill, prepend_skills, read_skill,
+    remove_skill, resolve_skills, skill_preamble, skill_sources, user_skills_dir, Skill,
+    SkillSource, MAX_ATTACHED_SKILLS, MAX_SKILL_BODY_CHARS,
 };
 mod api;
 pub use ai_tools::{
@@ -81,6 +81,8 @@ pub struct Config {
     pub max_context_chars: usize,
     pub api: ApiConfig,
     pub local: LocalConfig,
+    /// Local MCP servers usable with tool consultations (`[[connectors]]`).
+    pub connectors: Vec<ConnectorConfig>,
 }
 impl Default for Config {
     fn default() -> Self {
@@ -90,6 +92,7 @@ impl Default for Config {
             max_context_chars: 64000,
             api: ApiConfig::default(),
             local: LocalConfig::default(),
+            connectors: Vec::new(),
         }
     }
 }
@@ -110,6 +113,15 @@ impl Config {
         }
         if !(1..=4_000_000).contains(&c.max_context_chars) {
             return Err("max_context_chars は1〜4000000です".into());
+        }
+        for (index, connector) in c.connectors.iter().enumerate() {
+            connector.validate()?;
+            if c.connectors[..index]
+                .iter()
+                .any(|other| other.name == connector.name)
+            {
+                return Err(format!("コネクター「{}」が重複しています", connector.name));
+            }
         }
         Ok(c)
     }

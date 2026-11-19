@@ -61,24 +61,7 @@ pub fn library_dir() -> Option<PathBuf> {
 
 /// Resolve attached skill names against the current library and workspace.
 pub fn resolve_skills(names: &[String], workspace: Option<&str>) -> Result<Vec<Skill>, String> {
-    if names.is_empty() {
-        return Ok(Vec::new());
-    }
-    let library = library_dir();
-    let sources = codebot_core::skill_sources(library.as_deref(), workspace.map(Path::new));
-    let (available, _) = codebot_core::list_skills(&sources);
-    names
-        .iter()
-        .map(|name| {
-            available
-                .iter()
-                .find(|s| &s.name == name)
-                .cloned()
-                .ok_or_else(|| {
-                    format!("スキル「{name}」が見つかりません。ライブラリを確認してください")
-                })
-        })
-        .collect()
+    codebot_core::resolve_skills(names, workspace.map(Path::new))
 }
 
 impl LibraryPanel {

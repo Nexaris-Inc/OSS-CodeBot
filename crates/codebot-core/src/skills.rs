@@ -277,6 +277,48 @@ pub fn skill_preamble(skills: &[Skill]) -> String {
     text
 }
 
+/// Add the skills' instructions in front of the first request message. The
+/// input limit is widened by the instructions' size; the whole request stays
+/// within `max_context_chars`.
+pub fn prepend_skills(
+    config: &crate::Config,
+    messages: &mut [crate::ChatMessage],
+    skills: &[Skill],
+) -> Result<(), String> {
+    let preamble = skill_preamble(skills);
+    if preamble.is_empty() || messages.is_empty() {
+        return Ok(());
+    }
+    messages[0].content.insert_str(0, &preamble);
+    let mut limits = config.clone();
+    limits.max_input_chars = limits
+        .max_input_chars
+        .saturating_add(preamble.chars().count());
+    crate::validate_messages(&limits, messages)
+        .map_err(|e| format!("スキルを含めると送信できません：{e}"))
+}
+
+/// Resolve skill names against the app library, the workspace and `~/.claude/skills`.
+pub fn resolve_skills(names: &[String], workspace: Option<&Path>) -> Result<Vec<Skill>, String> {
+    if names.is_empty() {
+        return Ok(Vec::new());
+    }
+    let library = default_skills_dir();
+    let (available, _) = list_skills(&skill_sources(library.as_deref(), workspace));
+    names
+        .iter()
+        .map(|name| {
+            available
+                .iter()
+                .find(|s| &s.name == name)
+                .cloned()
+                .ok_or_else(|| {
+                    format!("スキル「{name}」が見つかりません。ライブラリを確認してください")
+                })
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
