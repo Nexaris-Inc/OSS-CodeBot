@@ -55,6 +55,14 @@ These tokens live in `crates/codebot-gui/src/main.rs`. The UI has no decorative 
 - Below 900px, replace the sidebar with a session menu. Support the minimum 700×540 viewport without shrinking text.
 - Below the composer, name the active API destination or state that local processing sends nothing externally. Never show a non-networked claim for API mode. Do not repeat it across header and sidebar.
 
+## Library, skills, connectors and context
+
+- The header has a ライブラリ destination. The library page lists skills (from the app library, the workspace `.claude/skills`, and `~/.claude/skills`) and registered connectors as outlined cards, each with a このチャットで使う selection control. Import and registration forms sit below their lists; deletion needs a second confirming press.
+- The composer has a circular add button on the left of the input. It opens a menu of library skills and connectors with selection controls and a link to the library page. Attached items appear above the composer as input chips (colored dot, kind, name, drawn close mark); pressing a chip removes it.
+- The composer footer shows a compact context meter: percentage plus a 72px segmented bar. Hovering it shows the breakdown: a full-width segmented bar, one legend row per category (skills, history, attachments, input; tool definitions and consultation data in AIに作業を相談) and free space. Categories that will not be sent are gray with a short reason. Values are characters against `max_context_chars`, labelled as an estimate, never as tokens.
+- Segment colors: skills #7D5260, tool definitions #5B5F97, history #005FB8, attachments #2E7D5B, input #B26A00, free space surface-container-high.
+- Connector tool requests in AIに作業を相談 show connector, tool, description, arguments, program, working folder, environment variable names and timeout before an explicit run action, then reuse the existing result-confirmation step.
+
 ## Validation scope
 
 Linux virtual-display captures cover 1180×800 and 700×540, empty and populated history, settings, and multiline input. Tests cover core/CLI behavior and GUI session state. Windows/macOS runtime and assistive technology remain unverified.

@@ -1,14 +1,26 @@
 use serde::Deserialize;
 mod ai_tools;
+mod connectors;
 mod plugins;
+pub use connectors::{
+    call_connector_tool, list_connector_tools, ConnectorConfig, ConnectorOutput, ConnectorTool,
+    MAX_ATTACHED_CONNECTORS, MAX_CONNECTOR_RESULT_CHARS,
+};
+mod skills;
 pub use plugins::{
     default_plugins_dir, install_plugin, list_plugins, prepare_plugin_install,
     prepare_plugin_remove, remove_plugin, run_plugin, set_plugin_enabled, PluginEntry,
     PluginManifest, PluginPermission, PluginRun, PreparedPluginInstall, PreparedPluginRemove,
 };
+pub use skills::{
+    default_skills_dir, import_skill, list_skills, parse_skill, read_skill, remove_skill,
+    skill_preamble, skill_sources, user_skills_dir, Skill, SkillSource, MAX_ATTACHED_SKILLS,
+    MAX_SKILL_BODY_CHARS,
+};
 mod api;
 pub use ai_tools::{
-    AgentEvent, AgentReply, ToolAction, ToolCall, ToolConversation, ToolResult, ToolStatus,
+    offered_connector_tools, tool_definitions_chars, AgentEvent, AgentReply, ToolAction, ToolCall,
+    ToolConversation, ToolResult, ToolStatus,
 };
 mod api_diagnostics;
 pub use api_diagnostics::{

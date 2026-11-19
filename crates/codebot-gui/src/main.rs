@@ -17,8 +17,10 @@ mod change_panel;
 mod chat_storage;
 mod checkbox;
 mod command_panel;
+mod context_bar;
 mod git_panel;
 mod github_panel;
+mod library;
 mod local_diagnostics;
 mod local_models;
 mod markdown;
@@ -89,6 +91,10 @@ struct Session {
     #[serde(skip)]
     stream_index: Option<usize>,
     generation_incomplete: bool,
+    /// Skill names attached to this chat.
+    skills: Vec<String>,
+    /// Connector names attached to this chat.
+    connectors: Vec<String>,
 }
 impl Session {
     fn request_messages(
@@ -191,6 +197,11 @@ struct App {
     github_open: bool,
     tools_open: bool,
     plugins_open: bool,
+    library_open: bool,
+    library_panel: library::LibraryPanel,
+    connectors: Vec<codebot_core::ConnectorConfig>,
+    /// (config path, max_context_chars, max_input_chars) for the context meter.
+    budget_cache: Option<(String, usize, usize)>,
     plugin_panel: plugins::PluginPanel,
     tool_panel: ai_tools::ToolPanel,
     github_panel: github_panel::GithubPanel,
@@ -205,6 +216,7 @@ impl Drop for App {
         self.github_panel.shutdown();
         self.tool_panel.shutdown();
         self.plugin_panel.shutdown();
+        self.library_panel.shutdown();
         self.pending = None;
         self.flush_chats();
     }
@@ -250,6 +262,10 @@ impl Default for App {
             github_open: false,
             tools_open: false,
             plugins_open: false,
+            library_open: false,
+            library_panel: library::LibraryPanel::default(),
+            connectors: Vec::new(),
+            budget_cache: None,
             plugin_panel: plugins::PluginPanel::default(),
             tool_panel: ai_tools::ToolPanel::default(),
             github_panel: github_panel::GithubPanel::default(),
@@ -512,6 +528,7 @@ impl App {
                     app.api_configs = preferences.api_configs;
                     app.local.config = preferences.local;
                     app.github_panel.config = preferences.github;
+                    app.connectors = preferences.connectors;
                     app.save_chats = preferences.save_chats;
                     app.archive_path_override = preferences.chat_archive_path;
                     app.archive_path_edit = app.archive_path_override.clone();
@@ -547,11 +564,24 @@ impl App {
                 last_change_root,
                 last_change_journal,
                 github: self.github_panel.config.clone(),
+                connectors: self.connectors.clone(),
             }
             .save(path)
             .err(),
             None => Some("設定の保存先を取得できません。この起動中のみ反映されます。".into()),
         };
+    }
+    /// Close every full-page view and return to the chat.
+    fn close_pages(&mut self) {
+        self.settings = false;
+        self.files_open = false;
+        self.changes_open = false;
+        self.commands_open = false;
+        self.git_open = false;
+        self.github_open = false;
+        self.tools_open = false;
+        self.plugins_open = false;
+        self.library_open = false;
     }
     fn new_chat(&mut self) {
         self.sessions.push(Session::default());
@@ -564,6 +594,7 @@ impl App {
         self.github_open = false;
         self.tools_open = false;
         self.plugins_open = false;
+        self.library_open = false;
         self.delete_confirm = false;
         self.sessions_dirty = true;
     }
@@ -607,7 +638,7 @@ impl App {
             }
         };
         let destination = self.destination_key();
-        let messages = match self.sessions[self.active].request_messages(
+        let mut messages = match self.sessions[self.active].request_messages(
             &config,
             &destination,
             self.backend == Backend::Rules,
@@ -618,9 +649,18 @@ impl App {
                 return;
             }
         };
+        // The history keeps the user's own input; skill instructions are added to
+        // this request only.
+        let request_input = messages.last().unwrap().content.clone();
+        if self.backend != Backend::Rules {
+            if let Err(e) = apply_skills(&self.sessions[self.active], &config, &mut messages) {
+                self.sessions[self.active].notice = Some(e);
+                return;
+            }
+        }
         self.sessions[self.active].notice = None;
         let input = std::mem::take(&mut self.sessions[self.active].draft);
-        self.sessions[self.active].in_flight_input = Some(messages.last().unwrap().content.clone());
+        self.sessions[self.active].in_flight_input = Some(request_input);
         self.sessions_dirty = true;
         let attachments = std::mem::take(&mut self.sessions[self.active].attachments);
         self.sessions[self.active].analysis_action = None;
@@ -775,6 +815,190 @@ impl App {
             api.model
         )
     }
+    /// Configured character budgets: (max_context_chars, max_input_chars).
+    fn budgets(&mut self) -> (usize, usize) {
+        let path = self.config_path.trim().to_owned();
+        if self.budget_cache.as_ref().map(|(p, _, _)| p) != Some(&path) {
+            let config = Config::load(if path.is_empty() {
+                None
+            } else {
+                Some(Path::new(&path))
+            })
+            .unwrap_or_default();
+            self.budget_cache = Some((path, config.max_context_chars, config.max_input_chars));
+        }
+        let (_, context, input) = self.budget_cache.as_ref().unwrap();
+        (*context, *input)
+    }
+    /// What the next chat request would contain, by category.
+    fn context_segments(&mut self) -> (Vec<context_bar::Segment>, usize) {
+        let (budget, _) = self.budgets();
+        let rules = self.backend == Backend::Rules;
+        let workspace = self.sessions[self.active].workspace_root.clone();
+        self.library_panel.ensure_loaded(workspace.as_deref());
+        let session = &self.sessions[self.active];
+        let skills: Vec<_> = self
+            .library_panel
+            .skills
+            .iter()
+            .filter(|s| session.skills.contains(&s.name))
+            .cloned()
+            .collect();
+        let skill_chars = codebot_core::skill_preamble(&skills).chars().count();
+        let history_chars: usize = session
+            .history
+            .iter()
+            .map(|m| m.content.chars().count())
+            .sum();
+        let input = session
+            .analysis_action
+            .map(|action| format!("{}\n\n利用者の依頼:\n{}", action.prompt(), session.draft))
+            .unwrap_or_else(|| session.draft.clone());
+        let input_chars = input.trim().chars().count();
+        let attachment_chars = codebot_core::compose_input(&input, &session.attachments)
+            .map(|t| t.chars().count().saturating_sub(input_chars))
+            .unwrap_or(0);
+        let mut skill = context_bar::Segment::new("スキル", skill_chars, context_bar::SKILLS);
+        if rules && skill_chars > 0 {
+            skill = skill.note("ローカル診断では未使用");
+        }
+        let mut history =
+            context_bar::Segment::new("会話履歴", history_chars, context_bar::HISTORY);
+        if rules {
+            history = history.note("ローカル診断では未使用");
+        } else if !session.history_enabled {
+            history = history.note("履歴送信オフ");
+        }
+        (
+            vec![
+                skill,
+                history,
+                context_bar::Segment::new(
+                    "添付ファイル",
+                    attachment_chars,
+                    context_bar::ATTACHMENTS,
+                ),
+                context_bar::Segment::new("入力", input_chars, context_bar::INPUT),
+            ],
+            budget,
+        )
+    }
+    /// Chips for skills and connectors attached to this chat.
+    fn attached_chips(&mut self, ui: &mut egui::Ui) {
+        let session = &mut self.sessions[self.active];
+        if session.skills.is_empty() && session.connectors.is_empty() {
+            return;
+        }
+        let mut remove_skill = None;
+        let mut remove_connector = None;
+        ui.horizontal_wrapped(|ui| {
+            for name in &session.skills {
+                if chip(ui, "スキル", name, context_bar::SKILLS)
+                    .on_hover_text("送信時にスキルの指示を依頼の前に付けます")
+                    .clicked()
+                {
+                    remove_skill = Some(name.clone());
+                }
+            }
+            for name in &session.connectors {
+                if chip(ui, "コネクター", name, context_bar::TOOLS)
+                    .on_hover_text("「実行 → AIに作業を相談」でツールをAIに提示します")
+                    .clicked()
+                {
+                    remove_connector = Some(name.clone());
+                }
+            }
+        });
+        if let Some(name) = remove_skill {
+            session.skills.retain(|n| *n != name);
+            self.sessions_dirty = true;
+        }
+        if let Some(name) = remove_connector {
+            session.connectors.retain(|n| *n != name);
+            self.sessions_dirty = true;
+        }
+        ui.add_space(4.0);
+    }
+    /// Popup from the composer's add button: toggle library items for this chat.
+    fn attach_menu(&mut self, ui: &mut egui::Ui, button: &egui::Response) {
+        let id = ui.make_persistent_id(("attach-menu", self.active));
+        if button.clicked() {
+            let workspace = self.sessions[self.active].workspace_root.clone();
+            self.library_panel.reload(workspace.as_deref());
+            ui.memory_mut(|m| m.toggle_popup(id));
+        }
+        let above = !self.sessions[self.active].messages.is_empty();
+        let mut open_library = false;
+        egui::popup::popup_above_or_below_widget(
+            ui,
+            id,
+            button,
+            if above {
+                egui::AboveOrBelow::Above
+            } else {
+                egui::AboveOrBelow::Below
+            },
+            egui::PopupCloseBehavior::CloseOnClickOutside,
+            |ui| {
+                ui.set_min_width(260.0);
+                let session = &mut self.sessions[self.active];
+                ui.label(RichText::new("スキル").size(12.0).color(MUTED));
+                if self.library_panel.skills.is_empty() {
+                    ui.label(
+                        RichText::new("ライブラリにスキルがありません")
+                            .size(13.0)
+                            .color(MUTED),
+                    );
+                }
+                for skill in &self.library_panel.skills {
+                    let mut on = session.skills.contains(&skill.name);
+                    let response = ui
+                        .add(checkbox::Checkbox::new(&mut on, &skill.name))
+                        .on_hover_text(&skill.description);
+                    if response.changed() {
+                        if on && session.skills.len() < codebot_core::MAX_ATTACHED_SKILLS {
+                            session.skills.push(skill.name.clone());
+                        } else {
+                            session.skills.retain(|n| n != &skill.name);
+                        }
+                        self.sessions_dirty = true;
+                    }
+                }
+                ui.separator();
+                ui.label(RichText::new("コネクター").size(12.0).color(MUTED));
+                if self.connectors.is_empty() {
+                    ui.label(
+                        RichText::new("登録済みのコネクターがありません")
+                            .size(13.0)
+                            .color(MUTED),
+                    );
+                }
+                for connector in &self.connectors {
+                    let mut on = session.connectors.contains(&connector.name);
+                    if ui
+                        .add(checkbox::Checkbox::new(&mut on, &connector.name))
+                        .changed()
+                    {
+                        if on && session.connectors.len() < codebot_core::MAX_ATTACHED_CONNECTORS {
+                            session.connectors.push(connector.name.clone());
+                        } else {
+                            session.connectors.retain(|n| n != &connector.name);
+                        }
+                        self.sessions_dirty = true;
+                    }
+                }
+                ui.separator();
+                if ui.button("ライブラリを管理…").clicked() {
+                    open_library = true;
+                }
+            },
+        );
+        if open_library {
+            ui.memory_mut(|m| m.close_popup());
+            self.close_pages();
+            self.library_open = true;
+        }
+    }
     fn composer(&mut self, ui: &mut egui::Ui) {
         let mut remove = None;
         for (index, attachment) in self.sessions[self.active].attachments.iter().enumerate() {
@@ -808,6 +1032,7 @@ impl App {
             self.sessions[self.active].attachments.remove(index);
             self.sessions_dirty = true;
         }
+        self.attached_chips(ui);
         let enabled = self.pending.is_none()
             && !self.change_panel.is_busy()
             && !self.command_panel.is_busy()
@@ -823,6 +1048,8 @@ impl App {
             .inner_margin(egui::Margin::symmetric(18, 16))
             .show(ui, |ui| {
                 ui.horizontal(|ui| {
+                    let add = icon_button(ui, Icon::New, "スキル・コネクターを追加", true, false);
+                    self.attach_menu(ui, &add);
                     let text_width =
                         (ui.available_width() - 40.0 - ui.spacing().item_spacing.x).max(100.0);
                     ui.allocate_ui_with_layout(
@@ -898,8 +1125,9 @@ impl App {
                 )
             };
             ui.label(RichText::new(notice).size(12.0).color(MUTED));
-            if ui.available_width() > 120.0 {
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            let (segments, budget) = self.context_segments();
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if ui.available_width() > 220.0 {
                     ui.label(
                         RichText::new(if cfg!(target_os = "macos") {
                             "⌘ Enter"
@@ -909,8 +1137,12 @@ impl App {
                         .size(11.0)
                         .color(MUTED),
                     );
-                });
-            }
+                    ui.add_space(8.0);
+                }
+                if ui.available_width() > 110.0 {
+                    context_bar::compact(ui, &segments, budget);
+                }
+            });
         });
         if self.backend != Backend::Rules {
             let destination = self.destination_key();
@@ -1298,6 +1530,7 @@ impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _: &mut eframe::Frame) {
         self.poll();
         self.github_panel.poll();
+        self.library_panel.poll();
         for root in [
             self.change_panel.poll(),
             self.command_panel.poll(),
@@ -1346,6 +1579,7 @@ impl eframe::App for App {
             && !self.github_open
             && !self.tools_open
             && !self.plugins_open
+            && !self.library_open
             && ctx.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::Enter))
         {
             self.send(ctx);
@@ -1421,6 +1655,7 @@ impl eframe::App for App {
                                     self.github_open = false;
                                     self.tools_open = false;
                                     self.plugins_open = false;
+                                    self.library_open = false;
                                     self.delete_confirm = false;
                                     self.sessions_dirty = true;
                                 }
@@ -1449,6 +1684,7 @@ impl eframe::App for App {
                             self.github_open = false;
                             self.tools_open = false;
                             self.plugins_open = false;
+                            self.library_open = false;
                         }
                     });
                 });
@@ -1485,7 +1721,7 @@ impl eframe::App for App {
                                         self.active = i;
                                         self.settings = false;
                                         self.files_open = false;
-                                        self.changes_open = false; self.commands_open = false; self.git_open=false; self.github_open=false; self.tools_open=false;self.plugins_open=false;
+                                        self.changes_open = false; self.commands_open = false; self.git_open=false; self.github_open=false; self.tools_open=false;self.plugins_open=false; self.library_open = false;
                                         self.delete_confirm = false;
                                         self.sessions_dirty = true;
                                         ui.close_menu();
@@ -1493,39 +1729,47 @@ impl eframe::App for App {
                                 }
                             });
                         }
-                        let title = if self.plugins_open {"拡張機能".into()} else if self.tools_open {"AIに作業を相談".into()} else if self.settings { "設定".into() } else if self.github_open { "GitHub".into() } else if self.git_open { "Git".into() } else if self.commands_open { "コマンドの実行".into() } else if self.changes_open { "変更の確認".into() }
+                        let title = if self.library_open {"ライブラリ".into()} else if self.plugins_open {"拡張機能".into()} else if self.tools_open {"AIに作業を相談".into()} else if self.settings { "設定".into() } else if self.github_open { "GitHub".into() } else if self.git_open { "Git".into() } else if self.commands_open { "コマンドの実行".into() } else if self.changes_open { "変更の確認".into() }
                             else if self.files_open { "参照ファイル".into() } else { self.sessions[self.active].title() };
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                             if icon_button(ui, Icon::Settings, "設定", true, false).clicked() {
                                 self.files_open = false;
-                                self.changes_open = false; self.commands_open = false; self.git_open=false; self.github_open=false; self.tools_open=false;self.plugins_open=false;
+                                self.changes_open = false; self.commands_open = false; self.git_open=false; self.github_open=false; self.tools_open=false;self.plugins_open=false; self.library_open = false;
                                 self.settings = !self.settings;
                             }
                             if icon_button(ui, Icon::New, "新しいチャット", true, false).clicked()
                             {
                                 self.new_chat();
                             }
-                            if tab_button(ui, "ファイル", self.files_open).clicked() { self.files_open = !self.files_open; self.settings = false; self.changes_open = false; self.commands_open = false; self.git_open=false; self.github_open=false; self.tools_open=false;self.plugins_open=false; }
-                            if tab_button(ui, "変更", self.changes_open).clicked() { self.changes_open = !self.changes_open; self.settings = false; self.files_open = false; self.commands_open=false; self.git_open=false; self.github_open=false; self.tools_open=false;self.plugins_open=false; }
+                            if tab_button(ui, "ファイル", self.files_open).clicked() { self.files_open = !self.files_open; self.settings = false; self.changes_open = false; self.commands_open = false; self.git_open=false; self.github_open=false; self.tools_open=false;self.plugins_open=false; self.library_open = false; }
+                            if tab_button(ui, "ライブラリ", self.library_open).clicked() {
+                                let open = !self.library_open;
+                                self.close_pages();
+                                self.library_open = open;
+                                let workspace = self.sessions[self.active].workspace_root.clone();
+                                self.library_panel.reload(workspace.as_deref());
+                            }
+                            if tab_button(ui, "変更", self.changes_open).clicked() { self.changes_open = !self.changes_open; self.settings = false; self.files_open = false; self.commands_open=false; self.git_open=false; self.github_open=false; self.tools_open=false;self.plugins_open=false; self.library_open = false; }
                             let run_menu = tab_button(ui, "実行", self.commands_open || self.tools_open || self.plugins_open);
                             let run_menu_id = ui.make_persistent_id("run-menu");
                             if run_menu.clicked() { ui.memory_mut(|m| m.toggle_popup(run_menu_id)); }
                             egui::popup_below_widget(ui, run_menu_id, &run_menu, egui::PopupCloseBehavior::CloseOnClick, |ui| {
                                 ui.set_min_width(200.0);
                                 ui.style_mut().visuals.button_frame = false;
-                                if ui.button("コマンドを確認して実行").clicked() {self.commands_open=true;self.tools_open=false;self.plugins_open=false;self.settings=false;self.files_open=false;self.changes_open=false;self.git_open=false;self.github_open=false;self.command_panel.set_initial_root(self.sessions[self.active].workspace_root.as_deref());ui.close_menu();}
+                                if ui.button("コマンドを確認して実行").clicked() {self.commands_open=true;self.tools_open=false;self.plugins_open=false; self.library_open = false;self.settings=false;self.files_open=false;self.changes_open=false;self.git_open=false;self.github_open=false;self.command_panel.set_initial_root(self.sessions[self.active].workspace_root.as_deref());ui.close_menu();}
                                 if ui.button("AIに作業を相談").clicked() {
                                     let session=&self.sessions[self.active];let prompt=codebot_core::compose_input(&session.draft,&session.attachments).unwrap_or_else(|_|session.draft.clone());
-                                    self.tool_panel.set_initial(session.workspace_root.as_deref(),&prompt);
-                                    self.commands_open=false;self.settings=false;self.files_open=false;self.changes_open=false;self.git_open=false;self.github_open=false;self.tools_open=true;self.plugins_open=false;ui.close_menu();
+                                    let connectors=self.connectors.iter().filter(|c|session.connectors.contains(&c.name)).cloned().collect();
+                                    self.tool_panel.set_initial(session.workspace_root.as_deref(),&prompt,session.skills.clone(),connectors);
+                                    self.commands_open=false;self.settings=false;self.files_open=false;self.changes_open=false;self.git_open=false;self.github_open=false;self.tools_open=true;self.plugins_open=false; self.library_open = false;ui.close_menu();
                                 }
                                 if ui.button("拡張機能").clicked() {
                                     let session=&self.sessions[self.active];self.plugin_panel.set_initial(session.workspace_root.as_deref(),&session.draft,&session.attachments);
-                                    self.commands_open=false;self.settings=false;self.files_open=false;self.changes_open=false;self.git_open=false;self.github_open=false;self.tools_open=false;self.plugins_open=true;ui.close_menu();
+                                    self.commands_open=false;self.settings=false;self.files_open=false;self.changes_open=false;self.git_open=false;self.github_open=false;self.tools_open=false;self.plugins_open=true; self.library_open = false;ui.close_menu();
                                 }
                             });
-                            if tab_button(ui, "Git", self.git_open).clicked() { self.git_open=!self.git_open; self.github_open=false; self.tools_open=false;self.plugins_open=false; self.settings=false; self.files_open=false; self.changes_open=false; self.commands_open=false; self.git_panel.set_initial_root(self.sessions[self.active].workspace_root.as_deref()); }
-                            if tab_button(ui, "GitHub", self.github_open).clicked() { self.github_open=!self.github_open;self.tools_open=false;self.plugins_open=false; self.git_open=false; self.settings=false; self.files_open=false; self.changes_open=false; self.commands_open=false; }
+                            if tab_button(ui, "Git", self.git_open).clicked() { self.git_open=!self.git_open; self.github_open=false; self.tools_open=false;self.plugins_open=false; self.library_open = false; self.settings=false; self.files_open=false; self.changes_open=false; self.commands_open=false; self.git_panel.set_initial_root(self.sessions[self.active].workspace_root.as_deref()); }
+                            if tab_button(ui, "GitHub", self.github_open).clicked() { self.github_open=!self.github_open;self.tools_open=false;self.plugins_open=false; self.library_open = false; self.git_open=false; self.settings=false; self.files_open=false; self.changes_open=false; self.commands_open=false; }
                             ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
                                 ui.add(egui::Label::new(RichText::new(title).size(16.0).color(TEXT)).truncate());
                             });
@@ -1537,12 +1781,29 @@ impl eframe::App for App {
                     let left = bounds.center().x - width / 2.0;
                     let composer_width = (bounds.width() - 32.0).min(COMPOSER_WIDTH).max(200.0);
                     let composer_left = bounds.center().x - composer_width / 2.0;
-                    if self.plugins_open {
+                    if self.library_open {
+                        let rect=egui::Rect::from_min_max(egui::pos2(left,bounds.top()),egui::pos2(left+width,bounds.bottom()));
+                        ui.scope_builder(egui::UiBuilder::new().max_rect(rect),|ui| {
+                            egui::ScrollArea::vertical().id_salt("library-page").show(ui,|ui| {
+                                let session = &mut self.sessions[self.active];
+                                let changes = self.library_panel.ui(ui, &mut self.connectors, library::Target {
+                                    skills: &mut session.skills,
+                                    connectors: &mut session.connectors,
+                                    workspace: session.workspace_root.as_deref(),
+                                });
+                                if changes.session { self.sessions_dirty = true; }
+                                if changes.preferences { self.save_preferences(); }
+                                if let Some(error) = &self.preferences_error { ui.colored_label(ui.visuals().error_fg_color, error); }
+                                ui.add_space(8.0);
+                                if ui.button("チャットに戻る").clicked() { self.library_open = false; }
+                            });
+                        });
+                    } else if self.plugins_open {
                         let rect=egui::Rect::from_min_max(egui::pos2(left,bounds.top()),egui::pos2(left+width,bounds.bottom()));
                         ui.scope_builder(egui::UiBuilder::new().max_rect(rect),|ui| {
                             egui::ScrollArea::vertical().show(ui,|ui| {
                                 self.plugin_panel.ui(ui,self.pending.is_none()&&!self.change_panel.is_busy()&&!self.command_panel.is_busy()&&!self.git_panel.is_busy()&&!self.github_panel.is_busy()&&!self.tool_panel.is_busy());
-                                if ui.button("チャットに戻る").clicked() {self.plugins_open=false;}
+                                if ui.button("チャットに戻る").clicked() {self.plugins_open=false; self.library_open = false;}
                             });
                         });
                     } else if self.tools_open {
@@ -1557,7 +1818,7 @@ impl eframe::App for App {
                                     },
                                     Err(error)=>{ui.label(error);}
                                 }
-                                if ui.button("チャットに戻る").clicked() {self.tools_open=false;self.plugins_open=false;}
+                                if ui.button("チャットに戻る").clicked() {self.tools_open=false;self.plugins_open=false; self.library_open = false;}
                             });
                         });
                     } else if self.github_open {
@@ -1569,17 +1830,17 @@ impl eframe::App for App {
                                         github_panel::Action::Save=>self.save_preferences(),
                                         github_panel::Action::Attach(text)=>{
                                             let mut limited=text.chars().take(12000).collect::<String>();if text.chars().count()>12000 {limited.push_str("\n（12000文字以降を省略）");}
-                                            let session=&mut self.sessions[self.active];if !session.draft.is_empty() {session.draft.push_str("\n\n");}session.draft.push_str(&limited);session.history_enabled=false;session.notice=Some("GitHubの資料を下書きに追加しました。内容を確認して送信してください。".into());self.sessions_dirty=true;self.github_open=false; self.tools_open=false;self.plugins_open=false;
+                                            let session=&mut self.sessions[self.active];if !session.draft.is_empty() {session.draft.push_str("\n\n");}session.draft.push_str(&limited);session.history_enabled=false;session.notice=Some("GitHubの資料を下書きに追加しました。内容を確認して送信してください。".into());self.sessions_dirty=true;self.github_open=false; self.tools_open=false;self.plugins_open=false; self.library_open = false;
                                         }
                                         github_panel::Action::Branch{branch,source}=>{
                                             match self.git_panel.prepare_issue_branch(ui.ctx(),self.sessions[self.active].workspace_root.as_deref(),&branch,&source) {
-                                                Ok(())=>{self.git_open=true;self.github_open=false; self.tools_open=false;self.plugins_open=false;},Err(error)=>self.github_panel.report_message(error)
+                                                Ok(())=>{self.git_open=true;self.github_open=false; self.tools_open=false;self.plugins_open=false; self.library_open = false;},Err(error)=>self.github_panel.report_message(error)
                                             }
                                         }
                                     }
                                 }
                                 if let Some(error)=&self.preferences_error {ui.colored_label(ui.visuals().error_fg_color,error);}
-                                if ui.button("チャットに戻る").clicked() {self.github_open=false; self.tools_open=false;self.plugins_open=false;}
+                                if ui.button("チャットに戻る").clicked() {self.github_open=false; self.tools_open=false;self.plugins_open=false; self.library_open = false;}
                             });
                         });
                     } else if self.git_open {
@@ -1587,7 +1848,7 @@ impl eframe::App for App {
                         ui.scope_builder(egui::UiBuilder::new().max_rect(rect),|ui| {
                             egui::ScrollArea::vertical().show(ui,|ui| {
                                 self.git_panel.ui(ui,self.pending.is_none() && !self.change_panel.is_busy() && !self.command_panel.is_busy() && !self.github_panel.is_busy() && !self.tool_panel.is_busy() && !self.plugin_panel.is_busy());
-                                if ui.button("チャットに戻る").clicked() {self.git_open=false; self.github_open=false; self.tools_open=false;self.plugins_open=false;}
+                                if ui.button("チャットに戻る").clicked() {self.git_open=false; self.github_open=false; self.tools_open=false;self.plugins_open=false; self.library_open = false;}
                             });
                         });
                     } else if self.commands_open {
@@ -1597,9 +1858,9 @@ impl eframe::App for App {
                                 if let Some(output)=self.command_panel.ui(ui,self.pending.is_none() && !self.change_panel.is_busy() && !self.git_panel.is_busy() && !self.github_panel.is_busy() && !self.tool_panel.is_busy() && !self.plugin_panel.is_busy()) {
                                     let session=&mut self.sessions[self.active];
                                     if !session.draft.is_empty() {session.draft.push_str("\n\n");}
-                                    session.draft.push_str(&output);session.history_enabled=false;self.sessions_dirty=true;self.commands_open=false; self.git_open=false; self.github_open=false; self.tools_open=false;self.plugins_open=false;
+                                    session.draft.push_str(&output);session.history_enabled=false;self.sessions_dirty=true;self.commands_open=false; self.git_open=false; self.github_open=false; self.tools_open=false;self.plugins_open=false; self.library_open = false;
                                 }
-                                if ui.button("チャットに戻る").clicked() {self.commands_open=false; self.git_open=false; self.github_open=false; self.tools_open=false;self.plugins_open=false;}
+                                if ui.button("チャットに戻る").clicked() {self.commands_open=false; self.git_open=false; self.github_open=false; self.tools_open=false;self.plugins_open=false; self.library_open = false;}
                             });
                         });
                     } else if self.changes_open {
@@ -1608,7 +1869,7 @@ impl eframe::App for App {
                             egui::ScrollArea::vertical().show(ui, |ui| {
                                 self.change_panel.ui(ui,self.pending.is_none() && !self.command_panel.is_busy() && !self.git_panel.is_busy() && !self.github_panel.is_busy() && !self.tool_panel.is_busy() && !self.plugin_panel.is_busy());
                                 if let Some(error) = &self.preferences_error { ui.colored_label(ui.visuals().error_fg_color,error); }
-                                if ui.button("チャットに戻る").clicked() { self.changes_open = false; self.commands_open = false; self.git_open=false; self.github_open=false; self.tools_open=false;self.plugins_open=false; }
+                                if ui.button("チャットに戻る").clicked() { self.changes_open = false; self.commands_open = false; self.git_open=false; self.github_open=false; self.tools_open=false;self.plugins_open=false; self.library_open = false; }
                             });
                         });
                     } else if self.files_open {
@@ -1747,6 +2008,72 @@ fn text_area(text: &mut dyn egui::TextBuffer) -> egui::TextEdit<'_> {
     egui::TextEdit::multiline(text).margin(FIELD_MARGIN)
 }
 
+/// Add the chat's skill instructions in front of the first request message.
+/// The input limit is widened by the instructions' size; the total stays within
+/// `max_context_chars`.
+fn apply_skills(
+    session: &Session,
+    config: &Config,
+    messages: &mut [ChatMessage],
+) -> Result<(), String> {
+    let skills = library::resolve_skills(&session.skills, session.workspace_root.as_deref())?;
+    let preamble = codebot_core::skill_preamble(&skills);
+    if preamble.is_empty() {
+        return Ok(());
+    }
+    messages[0].content.insert_str(0, &preamble);
+    let mut limits = config.clone();
+    limits.max_input_chars = limits
+        .max_input_chars
+        .saturating_add(preamble.chars().count());
+    validate_messages(&limits, messages).map_err(|e| format!("スキルを含めると送信できません：{e}"))
+}
+
+/// Material input chip with a colored dot and a remove action.
+fn chip(ui: &mut egui::Ui, kind: &str, name: &str, color: Color32) -> egui::Response {
+    let mut label = egui::text::LayoutJob::default();
+    label.append(
+        &format!("{kind}: {name}"),
+        14.0,
+        egui::TextFormat::simple(egui::FontId::proportional(13.0), ON_SECONDARY_CONTAINER),
+    );
+    // Room for the drawn close mark (the UI fonts have no ✕ glyph).
+    label.append(
+        " ",
+        18.0,
+        egui::TextFormat::simple(egui::FontId::proportional(13.0), MUTED),
+    );
+    let response = ui.add(
+        egui::Button::new(label)
+            .fill(SURFACE)
+            .stroke(egui::Stroke::new(1.0_f32, BORDER))
+            .corner_radius(8.0)
+            .min_size(egui::vec2(0.0, 30.0)),
+    );
+    ui.painter().circle_filled(
+        egui::pos2(response.rect.left() + 14.0, response.rect.center().y),
+        4.0,
+        color,
+    );
+    let mark = egui::pos2(response.rect.right() - 16.0, response.rect.center().y);
+    let stroke = egui::Stroke::new(1.5_f32, MUTED);
+    for (a, b) in [((-3.5, -3.5), (3.5, 3.5)), ((-3.5, 3.5), (3.5, -3.5))] {
+        ui.painter().line_segment(
+            [mark + egui::vec2(a.0, a.1), mark + egui::vec2(b.0, b.1)],
+            stroke,
+        );
+    }
+    state_layer(ui, &response, 8.0, TEXT);
+    response.widget_info(|| {
+        egui::WidgetInfo::labeled(
+            egui::WidgetType::Button,
+            true,
+            format!("{kind}「{name}」を外す"),
+        )
+    });
+    response
+}
+
 /// Material search bar: a full-radius container with a leading search icon.
 fn search_bar(ui: &mut egui::Ui, query: &mut String) -> egui::Response {
     egui::Frame::new()
@@ -1803,6 +2130,13 @@ fn drawer_item(ui: &mut egui::Ui, text: &str, selected: bool) -> egui::Response 
 
 /// Header destination: a Material text button that becomes tonal while its page is open.
 fn tab_button(ui: &mut egui::Ui, text: &str, selected: bool) -> egui::Response {
+    // Tighter padding below the 900px breakpoint so the bar fits 700px windows.
+    let padding = if ui.ctx().screen_rect().width() < 900.0 {
+        8.0
+    } else {
+        16.0
+    };
+    let previous = std::mem::replace(&mut ui.spacing_mut().button_padding.x, padding);
     let response = ui.add(
         egui::Button::new(RichText::new(text).size(14.0).color(if selected {
             ON_SECONDARY_CONTAINER
@@ -1819,6 +2153,7 @@ fn tab_button(ui: &mut egui::Ui, text: &str, selected: bool) -> egui::Response {
             Color32::TRANSPARENT
         }),
     );
+    ui.spacing_mut().button_padding.x = previous;
     let radius = response.rect.height() / 2.0;
     state_layer(ui, &response, radius, if selected { TEXT } else { ACCENT });
     focus_ring(ui, &response, radius);
@@ -2063,6 +2398,48 @@ fn main() -> eframe::Result {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn skills_are_added_to_the_request_copy_only_and_missing_skills_block_sending() {
+        let dir = tempfile::tempdir().unwrap();
+        let skill_dir = dir.path().join(".claude/skills/demo-skill");
+        std::fs::create_dir_all(&skill_dir).unwrap();
+        std::fs::write(
+            skill_dir.join("SKILL.md"),
+            "---\nname: demo-skill\ndescription: demo\n---\nAlways answer in bullet points.",
+        )
+        .unwrap();
+        let session = Session {
+            skills: vec!["demo-skill".into()],
+            workspace_root: Some(dir.path().to_string_lossy().into_owned()),
+            ..Default::default()
+        };
+        let config = Config {
+            max_input_chars: 10,
+            ..Default::default()
+        };
+        let mut messages = vec![ChatMessage::user("hi")];
+        apply_skills(&session, &config, &mut messages).unwrap();
+        assert!(messages[0]
+            .content
+            .contains("Always answer in bullet points."));
+        assert!(messages[0].content.ends_with("--- 利用者の依頼 ---\nhi"));
+
+        let small = Config {
+            max_context_chars: 20,
+            ..Default::default()
+        };
+        let mut messages = vec![ChatMessage::user("hi")];
+        assert!(apply_skills(&session, &small, &mut messages).is_err());
+
+        let missing = Session {
+            skills: vec!["not-installed".into()],
+            ..Default::default()
+        };
+        let mut messages = vec![ChatMessage::user("hi")];
+        assert!(apply_skills(&missing, &config, &mut messages)
+            .unwrap_err()
+            .contains("not-installed"));
+    }
     #[test]
     fn restoring_an_interrupted_generation_marks_partial_text_and_keeps_it_out_of_history() {
         let dir = tempfile::tempdir().unwrap();
