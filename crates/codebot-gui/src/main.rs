@@ -2623,17 +2623,15 @@ fn chip(
     );
     let mark = egui::pos2(response.rect.right() - 16.0, response.rect.center().y);
     let stroke = egui::Stroke::new(1.5_f32, MUTED());
-    let marks: &[((f32, f32), (f32, f32))] = if removable {
-        &[((-3.5, -3.5), (3.5, 3.5)), ((-3.5, 3.5), (3.5, -3.5))]
-    } else {
-        &[]
-    };
-    for &(a, b) in marks {
-        ui.painter().line_segment(
-            [mark + egui::vec2(a.0, a.1), mark + egui::vec2(b.0, b.1)],
-            stroke,
-        );
+    if removable {
+        for (a, b) in [((-3.5, -3.5), (3.5, 3.5)), ((-3.5, 3.5), (3.5, -3.5))] {
+            ui.painter().line_segment(
+                [mark + egui::vec2(a.0, a.1), mark + egui::vec2(b.0, b.1)],
+                stroke,
+            );
+        }
     }
+
     state_layer(ui, &response, 8.0, TEXT());
     response.widget_info(|| {
         egui::WidgetInfo::labeled(
