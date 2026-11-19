@@ -196,7 +196,7 @@ impl LocalModels {
             let native = self.config.engine == LocalEngine::Transformers;
             if native {
                 let python = ui.label("Python実行ファイル（Transformers環境）");
-                if ui.add(egui::TextEdit::singleline(&mut self.config.python_path).hint_text("仮想環境のpython / python.exe").desired_width(f32::INFINITY)).labelled_by(python.id).changed() {self.server=None;}
+                if ui.add(crate::text_field(&mut self.config.python_path).hint_text("仮想環境のpython / python.exe").desired_width(f32::INFINITY)).labelled_by(python.id).changed() {self.server=None;}
                 if ui.button("Pythonを選択").clicked() { self.picker=Some(crate::path_picker::PathPicker::new(crate::path_picker::Target::Python,&self.config.python_path)); }
                 ui.label("torch・transformers・accelerate・safetensors・huggingface_hubが必要です。");
             }
@@ -209,21 +209,21 @@ impl LocalModels {
             if self.config.preset!=previous {self.server=None;self.config.model_path.clear();self.config.hf_url.clear();self.config.sha256.clear();self.message=None;save=true;}
             if self.config.preset!=LocalPreset::Custom {ui.label("このモデル名の配布先・実行方式への対応は未確認です。対応形式のモデルを指定してください。");}
             let path=ui.label(if native {"公式形式モデルのフォルダ（safetensors・config・tokenizer）"} else {"ローカルモデルのパス（GGUF）"});
-            if ui.add(egui::TextEdit::singleline(&mut self.config.model_path).hint_text(if native {"/path/to/model-folder"} else {"/path/to/model.gguf"}).desired_width(f32::INFINITY)).labelled_by(path.id).changed() {self.server=None;}
+            if ui.add(crate::text_field(&mut self.config.model_path).hint_text(if native {"/path/to/model-folder"} else {"/path/to/model.gguf"}).desired_width(f32::INFINITY)).labelled_by(path.id).changed() {self.server=None;}
             if ui.button(if native {"モデルフォルダを選択"} else {"GGUFファイルを選択"}).clicked() { self.picker=Some(crate::path_picker::PathPicker::new(if native {crate::path_picker::Target::ModelFolder} else {crate::path_picker::Target::ModelFile},&self.config.model_path)); }
             ui.add_space(8.0);
             let source=ui.label(if native {"またはHugging FaceのリポジトリURL / ID"} else {"またはHugging FaceのファイルURL"});
-            ui.add(egui::TextEdit::singleline(&mut self.config.hf_url).hint_text(if native {"https://huggingface.co/owner/model または owner/model"} else {"https://huggingface.co/owner/repo/resolve/main/model.gguf"}).desired_width(f32::INFINITY)).labelled_by(source.id);
+            ui.add(crate::text_field(&mut self.config.hf_url).hint_text(if native {"https://huggingface.co/owner/model または owner/model"} else {"https://huggingface.co/owner/repo/resolve/main/model.gguf"}).desired_width(f32::INFINITY)).labelled_by(source.id);
             ui.collapsing("ダウンロード設定",|ui| {
                 if native {
                     let revision=ui.label("リビジョン（取得時に正確なコミットへ固定）");
-                    ui.add(egui::TextEdit::singleline(&mut self.config.hf_revision).desired_width(f32::INFINITY)).labelled_by(revision.id);
+                    ui.add(crate::text_field(&mut self.config.hf_revision).desired_width(f32::INFINITY)).labelled_by(revision.id);
                 } else {
                     let sha=ui.label("SHA-256（空欄は配布元から取得）");
-                    ui.add(egui::TextEdit::singleline(&mut self.config.sha256).desired_width(f32::INFINITY)).labelled_by(sha.id);
+                    ui.add(crate::text_field(&mut self.config.sha256).desired_width(f32::INFINITY)).labelled_by(sha.id);
                 }
                 let token=ui.label("HFトークン（保存せず、未入力ならHF_TOKENを参照）");
-                ui.add(egui::TextEdit::singleline(&mut self.hf_token).password(true).desired_width(f32::INFINITY)).labelled_by(token.id);
+                ui.add(crate::text_field(&mut self.hf_token).password(true).desired_width(f32::INFINITY)).labelled_by(token.id);
                 ui.horizontal(|ui| {ui.label("取得サイズ上限（GiB）");ui.add(egui::DragValue::new(&mut self.config.max_download_gib).range(1..=4096));});
                 ui.label(if native {"必要な設定・tokenizer・safetensors分割重みを取得・検証します。配布元の独自コードは実行しません。"} else {"分割GGUFは00001のURLを指定すると、全パートを同じコミットから取得・検証します。中断した取得は再実行で再開します。"});
                 ui.label("公開条件・ライセンスへの同意はHugging Face側で行ってください。");
@@ -232,7 +232,7 @@ impl LocalModels {
             ui.add_space(12.0);
             if !native {
                 let runtime=ui.label("llama-server 実行ファイル");
-                ui.add(egui::TextEdit::singleline(&mut self.config.server_path).hint_text("llama-server のインストール先").desired_width(f32::INFINITY)).labelled_by(runtime.id);
+                ui.add(crate::text_field(&mut self.config.server_path).hint_text("llama-server のインストール先").desired_width(f32::INFINITY)).labelled_by(runtime.id);
                 if ui.button("llama-serverを選択").clicked() { self.picker=Some(crate::path_picker::PathPicker::new(crate::path_picker::Target::Server,&self.config.server_path)); }
             }
             ui.collapsing("推論設定",|ui| {

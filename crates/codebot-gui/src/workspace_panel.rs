@@ -28,7 +28,7 @@ impl WorkspacePanel {
             }
         });
         ui.label("作業フォルダのフルパス");
-        if ui.text_edit_singleline(&mut self.root).changed() {
+        if ui.add(crate::text_field(&mut self.root)).changed() {
             self.preview = None;
             self.files.clear();
             self.selected.clear();

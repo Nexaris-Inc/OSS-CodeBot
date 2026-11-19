@@ -217,7 +217,7 @@ impl GitPanel {
         ui.add_enabled_ui(!busy, |ui| {
             ui.label("リポジトリの作業フォルダ");
             if ui
-                .add(egui::TextEdit::singleline(&mut self.root).desired_width(f32::INFINITY))
+                .add(crate::text_field(&mut self.root).desired_width(f32::INFINITY))
                 .changed()
             {
                 self.snapshot = None;
@@ -308,10 +308,7 @@ impl GitPanel {
                 ui.add_space(8.0);
                 ui.label("新しいブランチ名");
                 changed |= ui
-                    .add(
-                        egui::TextEdit::singleline(&mut self.new_branch)
-                            .desired_width(f32::INFINITY),
-                    )
+                    .add(crate::text_field(&mut self.new_branch).desired_width(f32::INFINITY))
                     .changed();
                 if ui.button("ブランチの作成を確認").clicked() {
                     operation = Some(GitOperation::CreateBranch {
@@ -322,7 +319,7 @@ impl GitPanel {
                 ui.label("コミット文");
                 changed |= ui
                     .add(
-                        egui::TextEdit::multiline(&mut self.commit_message)
+                        crate::text_area(&mut self.commit_message)
                             .desired_rows(2)
                             .desired_width(f32::INFINITY),
                     )
@@ -359,10 +356,7 @@ impl GitPanel {
                     });
                 ui.label("送信先ブランチ名");
                 changed |= ui
-                    .add(
-                        egui::TextEdit::singleline(&mut self.push_branch)
-                            .desired_width(f32::INFINITY),
-                    )
+                    .add(crate::text_field(&mut self.push_branch).desired_width(f32::INFINITY))
                     .changed();
                 if ui
                     .add_enabled(

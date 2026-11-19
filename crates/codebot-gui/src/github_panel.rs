@@ -271,11 +271,11 @@ impl GithubPanel {
             ui.hyperlink_to(format!("投稿先を開く：{}", receipt.number), &receipt.url);
         }
         ui.add_enabled_ui(!busy,|ui| {
-            ui.label("リポジトリ（owner/repository）");changed|=ui.add(egui::TextEdit::singleline(&mut self.config.repository).desired_width(f32::INFINITY)).changed();
+            ui.label("リポジトリ（owner/repository）");changed|=ui.add(crate::text_field(&mut self.config.repository).desired_width(f32::INFINITY)).changed();
             ui.collapsing("認証と接続先",|ui| {
-                ui.label("GitHub API URL");if ui.add(egui::TextEdit::singleline(&mut self.config.api_url).desired_width(f32::INFINITY)).changed() {self.token.clear();self.config.token_env.clear();changed=true;}
-                ui.label("トークン（この起動中だけ使用。保存しません）");if ui.add(egui::TextEdit::singleline(&mut self.token).password(true).desired_width(f32::INFINITY)).changed() {self.reset();}
-                ui.label("トークンの環境変数名");if ui.add(egui::TextEdit::singleline(&mut self.config.token_env).desired_width(f32::INFINITY)).changed() {self.reset();}
+                ui.label("GitHub API URL");if ui.add(crate::text_field(&mut self.config.api_url).desired_width(f32::INFINITY)).changed() {self.token.clear();self.config.token_env.clear();changed=true;}
+                ui.label("トークン（この起動中だけ使用。保存しません）");if ui.add(crate::text_field(&mut self.token).password(true).desired_width(f32::INFINITY)).changed() {self.reset();}
+                ui.label("トークンの環境変数名");if ui.add(crate::text_field(&mut self.config.token_env).desired_width(f32::INFINITY)).changed() {self.reset();}
                 ui.horizontal(|ui| {ui.label("待機時間（秒）");if ui.add(egui::DragValue::new(&mut self.config.timeout_seconds).range(1..=300)).changed() {self.reset();}});
                 ui.label("読み込みに必要なアクセス権と、投稿にはIssue/PRへの書き込み権が必要です。公開リポジトリの読み込みはトークンなしでも可能です。");
             });
@@ -339,7 +339,7 @@ impl GithubPanel {
                     });
                 ui.horizontal(|ui| {
                     ui.label("番号");
-                    ui.add(egui::TextEdit::singleline(&mut self.number).desired_width(100.0));
+                    ui.add(crate::text_field(&mut self.number).desired_width(100.0));
                     if ui.button("本文を読む").clicked() {
                         match self.number.trim().parse::<u64>() {
                             Ok(number) => request_doc = Some((self.kind, number)),
@@ -440,32 +440,22 @@ impl GithubPanel {
                 if self.write_kind != 2 {
                     ui.label("タイトル");
                     edit |= ui
-                        .add(
-                            egui::TextEdit::singleline(&mut self.title)
-                                .desired_width(f32::INFINITY),
-                        )
+                        .add(crate::text_field(&mut self.title).desired_width(f32::INFINITY))
                         .changed();
                 } else {
                     ui.label("投稿先のIssue/PR番号");
                     edit |= ui
-                        .add(
-                            egui::TextEdit::singleline(&mut self.comment_number)
-                                .desired_width(140.0),
-                        )
+                        .add(crate::text_field(&mut self.comment_number).desired_width(140.0))
                         .changed();
                 }
                 if self.write_kind == 1 {
                     ui.label("送信元ブランチ（head）");
                     edit |= ui
-                        .add(
-                            egui::TextEdit::singleline(&mut self.head).desired_width(f32::INFINITY),
-                        )
+                        .add(crate::text_field(&mut self.head).desired_width(f32::INFINITY))
                         .changed();
                     ui.label("対象ブランチ（base）");
                     edit |= ui
-                        .add(
-                            egui::TextEdit::singleline(&mut self.base).desired_width(f32::INFINITY),
-                        )
+                        .add(crate::text_field(&mut self.base).desired_width(f32::INFINITY))
                         .changed();
                     edit |= ui
                         .add(crate::checkbox::Checkbox::new(
@@ -477,7 +467,7 @@ impl GithubPanel {
                 ui.label("投稿本文");
                 edit |= ui
                     .add(
-                        egui::TextEdit::multiline(&mut self.body)
+                        crate::text_area(&mut self.body)
                             .desired_rows(6)
                             .desired_width(f32::INFINITY),
                     )

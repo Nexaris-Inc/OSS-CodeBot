@@ -82,9 +82,7 @@ impl PathPicker {
             .default_width(540.0)
             .show(ctx, |ui| {
                 ui.label("フォルダのパス");
-                ui.add(
-                    egui::TextEdit::singleline(&mut self.directory).desired_width(f32::INFINITY),
-                );
+                ui.add(crate::text_field(&mut self.directory).desired_width(f32::INFINITY));
                 ui.horizontal(|ui| {
                     if ui.button("読み込む").clicked() {
                         self.refresh();

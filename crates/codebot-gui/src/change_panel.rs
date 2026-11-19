@@ -175,7 +175,7 @@ impl ChangePanel {
             ui.label("作業フォルダのフルパス");
             if ui
                 .add(
-                    egui::TextEdit::singleline(&mut self.root)
+                    crate::text_field(&mut self.root)
                         .interactive(!self.root_locked)
                         .desired_width(f32::INFINITY),
                 )
@@ -190,7 +190,7 @@ impl ChangePanel {
                     ui.label("修正提案の回答を貼り付けるか、回答の「変更案を確認」から開きます。");
                     if ui
                         .add(
-                            egui::TextEdit::multiline(&mut self.text)
+                            crate::text_area(&mut self.text)
                                 .desired_width(f32::INFINITY)
                                 .desired_rows(5)
                                 .char_limit(1024 * 1024),
@@ -246,7 +246,7 @@ impl ChangePanel {
             if ui
                 .add_enabled(
                     self.task.is_none(),
-                    egui::TextEdit::singleline(&mut self.journal).desired_width(f32::INFINITY),
+                    crate::text_field(&mut self.journal).desired_width(f32::INFINITY),
                 )
                 .changed()
             {

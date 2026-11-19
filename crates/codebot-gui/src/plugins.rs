@@ -203,10 +203,7 @@ impl PluginPanel {
             ui.add_enabled_ui(!busy, |ui| {
                 ui.label("導入する拡張のmanifest.json");
                 if ui
-                    .add(
-                        egui::TextEdit::singleline(&mut self.manifest_path)
-                            .desired_width(f32::INFINITY),
-                    )
+                    .add(crate::text_field(&mut self.manifest_path).desired_width(f32::INFINITY))
                     .changed()
                 {
                     self.install = None;
@@ -385,7 +382,7 @@ impl PluginPanel {
                 let mut edited = false;
                 ui.label("作業フォルダ");
                 if ui
-                    .add(egui::TextEdit::singleline(&mut self.root).desired_width(f32::INFINITY))
+                    .add(crate::text_field(&mut self.root).desired_width(f32::INFINITY))
                     .changed()
                 {
                     self.files.clear();
@@ -394,7 +391,7 @@ impl PluginPanel {
                 ui.label("拡張に渡す入力");
                 edited |= ui
                     .add(
-                        egui::TextEdit::multiline(&mut self.prompt)
+                        crate::text_area(&mut self.prompt)
                             .desired_rows(3)
                             .desired_width(f32::INFINITY),
                     )

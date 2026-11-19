@@ -174,10 +174,10 @@ impl ToolPanel {
         if self.conversation.is_none() && self.task.is_none() {
             ui.add_enabled_ui(!busy, |ui| {
                 ui.label("作業フォルダ");
-                ui.add(egui::TextEdit::singleline(&mut self.root).desired_width(f32::INFINITY));
+                ui.add(crate::text_field(&mut self.root).desired_width(f32::INFINITY));
                 ui.label("相談する内容");
                 ui.add(
-                    egui::TextEdit::multiline(&mut self.prompt)
+                    crate::text_area(&mut self.prompt)
                         .desired_rows(4)
                         .desired_width(f32::INFINITY),
                 );
