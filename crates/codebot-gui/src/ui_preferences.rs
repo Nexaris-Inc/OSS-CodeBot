@@ -26,6 +26,7 @@ pub struct UiPreferences {
     pub last_change_journal: String,
     pub github: GithubConfig,
     pub connectors: Vec<codebot_core::ConnectorConfig>,
+    pub reduce_motion: bool,
 }
 
 impl UiPreferences {

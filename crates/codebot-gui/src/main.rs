@@ -59,6 +59,8 @@ const SELECTED: Color32 = Color32::from_rgb(215, 227, 247);
 const ON_SECONDARY_CONTAINER: Color32 = Color32::from_rgb(16, 28, 43);
 /// on-surface at 12% (container) and 38% (content) for disabled controls.
 const DISABLED: Color32 = Color32::from_rgb(225, 226, 230);
+/// Skeleton placeholder blocks shown while startup data loads.
+const SKELETON: Color32 = Color32::from_rgb(218, 222, 230);
 const DISABLED_CONTENT: Color32 = Color32::from_rgb(160, 162, 166);
 /// error.
 const ERROR: Color32 = Color32::from_rgb(186, 26, 26);
@@ -66,6 +68,10 @@ const ERROR: Color32 = Color32::from_rgb(186, 26, 26);
 const SHAPE_FULL: u8 = 255;
 const SHAPE_LARGE: f32 = 16.0;
 const SHAPE_EXTRA_LARGE: f32 = 28.0;
+/// Loading indicators appear only when startup work takes longer than this.
+const LOADING_DELAY: std::time::Duration = std::time::Duration::from_millis(300);
+/// Cross-fade from the loading state to the restored content.
+const REVEAL_MS: f32 = 140.0;
 const MEASURE: f32 = 680.0;
 const COMPOSER_WIDTH: f32 = 740.0;
 
@@ -202,6 +208,12 @@ struct App {
     connectors: Vec<codebot_core::ConnectorConfig>,
     /// (config path, max_context_chars, max_input_chars) for the context meter.
     budget_cache: Option<(String, usize, usize)>,
+    /// Saved chats being read at startup, and when reading began.
+    startup_load: Option<StartupLoad>,
+    /// Start of the cross-fade after a visible loading state.
+    reveal: Option<std::time::Instant>,
+    /// Stop the skeleton pulse, progress bar motion and cross-fade.
+    reduce_motion: bool,
     plugin_panel: plugins::PluginPanel,
     tool_panel: ai_tools::ToolPanel,
     github_panel: github_panel::GithubPanel,
@@ -266,6 +278,9 @@ impl Default for App {
             library_panel: library::LibraryPanel::default(),
             connectors: Vec::new(),
             budget_cache: None,
+            startup_load: None,
+            reveal: None,
+            reduce_motion: false,
             plugin_panel: plugins::PluginPanel::default(),
             tool_panel: ai_tools::ToolPanel::default(),
             github_panel: github_panel::GithubPanel::default(),
@@ -285,10 +300,48 @@ impl App {
             .map(|path| path.with_file_name("chats.json"))
     }
     fn restore_chats(&mut self, merge: bool) {
-        let result = self
-            .archive_path()
-            .ok_or_else(|| "チャット保存先を取得できません".to_owned())
-            .and_then(|path| chat_storage::load(&path));
+        let result = load_archive(self.archive_path());
+        self.apply_restored(result, merge);
+    }
+    /// Read saved chats on a background thread at startup. Saving and the chat
+    /// UI stay blocked until the result arrives, so the archive is never
+    /// overwritten with the empty startup session.
+    fn start_restore(&mut self, ctx: &egui::Context) {
+        let path = self.archive_path();
+        let (tx, rx) = mpsc::channel();
+        let ctx = ctx.clone();
+        std::thread::spawn(move || {
+            let _ = tx.send(load_archive(path));
+            ctx.request_repaint();
+        });
+        self.archive_blocked = true;
+        self.startup_load = Some((rx, std::time::Instant::now()));
+    }
+    /// Apply the startup load when it is ready. Returns true while still loading.
+    fn poll_restore(&mut self) -> bool {
+        let Some((rx, since)) = &self.startup_load else {
+            return false;
+        };
+        let result = match rx.try_recv() {
+            Ok(result) => result,
+            Err(mpsc::TryRecvError::Empty) => return true,
+            Err(mpsc::TryRecvError::Disconnected) => {
+                Err("チャットの読み込みが中断しました。元ファイルは保持しています".into())
+            }
+        };
+        // Cross-fade only when the loading state was actually visible.
+        if since.elapsed() >= LOADING_DELAY && !self.reduce_motion {
+            self.reveal = Some(std::time::Instant::now());
+        }
+        self.startup_load = None;
+        self.apply_restored(result, false);
+        false
+    }
+    fn apply_restored(
+        &mut self,
+        result: Result<Option<chat_storage::Archive>, String>,
+        merge: bool,
+    ) {
         match result {
             Ok(Some(mut archive)) => {
                 for session in &mut archive.sessions {
@@ -529,6 +582,7 @@ impl App {
                     app.local.config = preferences.local;
                     app.github_panel.config = preferences.github;
                     app.connectors = preferences.connectors;
+                    app.reduce_motion = preferences.reduce_motion;
                     app.save_chats = preferences.save_chats;
                     app.archive_path_override = preferences.chat_archive_path;
                     app.archive_path_edit = app.archive_path_override.clone();
@@ -541,7 +595,7 @@ impl App {
             }
         }
         if app.save_chats {
-            app.restore_chats(false);
+            app.start_restore(ctx);
         }
         apply_font(ctx, app.font);
         app
@@ -565,11 +619,140 @@ impl App {
                 last_change_journal,
                 github: self.github_panel.config.clone(),
                 connectors: self.connectors.clone(),
+                reduce_motion: self.reduce_motion,
             }
             .save(path)
             .err(),
             None => Some("設定の保存先を取得できません。この起動中のみ反映されます。".into()),
         };
+    }
+    /// Startup loading state: the shell's surfaces at once, and after
+    /// `LOADING_DELAY` a skeleton of the chat layout with a progress bar.
+    fn loading_ui(&mut self, ctx: &egui::Context) {
+        let elapsed = self
+            .startup_load
+            .as_ref()
+            .map_or(std::time::Duration::ZERO, |(_, since)| since.elapsed());
+        let visible = elapsed >= LOADING_DELAY;
+        if !visible {
+            ctx.request_repaint_after(LOADING_DELAY - elapsed);
+        } else if self.reduce_motion {
+            // The background thread also requests a repaint when it finishes.
+            ctx.request_repaint_after(std::time::Duration::from_millis(250));
+        } else {
+            ctx.request_repaint();
+        }
+        let seconds = elapsed.as_secs_f32();
+        // Skeleton blocks breathe between 55% and 100% every 0.9 s.
+        let alpha = if self.reduce_motion {
+            1.0
+        } else {
+            0.775 + 0.225 * (seconds * std::f32::consts::TAU / 0.9).cos()
+        };
+        let block = SKELETON.gamma_multiply(alpha);
+        let narrow = ctx.screen_rect().width() < 900.0;
+        if self.sidebar && !narrow {
+            egui::SidePanel::left("sidebar")
+                .exact_width(224.0)
+                .resizable(false)
+                .show_separator_line(false)
+                .frame(egui::Frame::new().fill(SHELL).inner_margin(egui::Margin {
+                    left: 12,
+                    right: 12,
+                    top: 16,
+                    bottom: 16,
+                }))
+                .show(ctx, |ui| {
+                    if !visible {
+                        return;
+                    }
+                    let rect = ui.max_rect();
+                    let p = ui.painter();
+                    let mut y = rect.top() + 6.0;
+                    let mut bar = |x: f32, w: f32, h: f32, r: f32, gap: f32| {
+                        p.rect_filled(
+                            egui::Rect::from_min_size(
+                                egui::pos2(rect.left() + x, y),
+                                egui::vec2(w, h),
+                            ),
+                            r,
+                            block,
+                        );
+                        y += h + gap;
+                    };
+                    bar(8.0, 96.0, 22.0, 6.0, 26.0); // brand
+                    bar(0.0, 160.0, 52.0, SHAPE_LARGE, 24.0); // new chat
+                    bar(0.0, rect.width(), 40.0, 20.0, 28.0); // search
+                    for width in [rect.width(), 150.0, 170.0] {
+                        bar(0.0, width, 36.0, 18.0, 8.0); // chats
+                    }
+                });
+        }
+        egui::CentralPanel::default()
+            .frame(egui::Frame::new().fill(SHELL).inner_margin(8.0))
+            .show(ctx, |ui| {
+                let area = ui.max_rect();
+                ui.painter().rect_filled(area, SHAPE_LARGE, SURFACE);
+                if !visible {
+                    return;
+                }
+                // Keep the band inside the pane's rounded corners.
+                let p = ui
+                    .painter()
+                    .with_clip_rect(area.shrink2(egui::vec2(SHAPE_LARGE, 0.0)));
+                // Progress: a 3px band along the pane's top edge.
+                let track = egui::Rect::from_min_size(area.min, egui::vec2(area.width(), 3.0));
+                if self.reduce_motion {
+                    p.rect_filled(track, 0.0, SELECTED);
+                } else {
+                    let phase = (seconds / 1.1).fract();
+                    let width = area.width() * 0.35;
+                    let left = area.left() - width + phase * (area.width() + width);
+                    p.rect_filled(
+                        egui::Rect::from_min_size(
+                            egui::pos2(left, area.top()),
+                            egui::vec2(width, 3.0),
+                        ),
+                        1.5,
+                        ACCENT,
+                    );
+                }
+                let inner = area.shrink(20.0);
+                let composer_width = (inner.width() - 32.0).clamp(200.0, COMPOSER_WIDTH);
+                let left = inner.center().x - composer_width / 2.0;
+                let top = inner.top() + 56.0 + ((inner.height() - 56.0) * 0.27).max(12.0);
+                let shapes = [
+                    (
+                        egui::pos2(inner.left(), inner.top() + 10.0),
+                        egui::vec2(140.0, 16.0),
+                        6.0,
+                    ),
+                    (egui::pos2(left, top), egui::vec2(220.0, 28.0), 8.0),
+                    (egui::pos2(left, top + 44.0), egui::vec2(300.0, 14.0), 6.0),
+                    (
+                        egui::pos2(left, top + 86.0),
+                        egui::vec2(composer_width, 72.0),
+                        SHAPE_EXTRA_LARGE,
+                    ),
+                ];
+                for (min, size, radius) in shapes {
+                    p.rect_filled(egui::Rect::from_min_size(min, size), radius, block);
+                }
+                // Text for assistive technology and for the reduced-motion case.
+                ui.scope_builder(
+                    egui::UiBuilder::new().max_rect(egui::Rect::from_min_size(
+                        egui::pos2(left, top + 172.0),
+                        egui::vec2(composer_width, 24.0),
+                    )),
+                    |ui| {
+                        ui.label(
+                            RichText::new("保存したチャットを読み込んでいます…")
+                                .size(12.0)
+                                .color(MUTED),
+                        );
+                    },
+                );
+            });
     }
     /// Close every full-page view and return to the chat.
     fn close_pages(&mut self) {
@@ -1500,6 +1683,28 @@ impl App {
             );
         }
         ui.add_space(28.0);
+        ui.label(
+            RichText::new("表示")
+                .size(14.0)
+                .family(egui::FontFamily::Name("ui-bold".into())),
+        );
+        if ui
+            .add(crate::checkbox::Checkbox::new(
+                &mut self.reduce_motion,
+                "動きを減らす",
+            ))
+            .changed()
+        {
+            self.save_preferences();
+        }
+        ui.label(
+            RichText::new(
+                "起動時の読み込み表示で、明滅・進捗バーの移動・切り替え時のフェードを止めます。",
+            )
+            .size(13.0)
+            .color(MUTED),
+        );
+        ui.add_space(28.0);
         let label = ui.label(
             RichText::new("設定ファイル")
                 .size(14.0)
@@ -1528,6 +1733,23 @@ impl App {
 }
 impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _: &mut eframe::Frame) {
+        if self.poll_restore() {
+            self.loading_ui(ctx);
+            return;
+        }
+        let reveal = match self.reveal {
+            Some(start) => {
+                let t = start.elapsed().as_secs_f32() * 1000.0 / REVEAL_MS;
+                if t >= 1.0 {
+                    self.reveal = None;
+                    1.0
+                } else {
+                    ctx.request_repaint();
+                    egui::emath::easing::cubic_out(t)
+                }
+            }
+            None => 1.0,
+        };
         self.poll();
         self.github_panel.poll();
         self.library_panel.poll();
@@ -1597,6 +1819,7 @@ impl eframe::App for App {
                     bottom: 16,
                 }))
                 .show(ctx, |ui| {
+                    ui.multiply_opacity(reveal);
                     ui.add_space(4.0);
                     ui.horizontal(|ui| {
                         ui.add_space(8.0);
@@ -1695,6 +1918,7 @@ impl eframe::App for App {
                 let area = ui.max_rect();
                 ui.painter().rect_filled(area, SHAPE_LARGE, SURFACE);
                 ui.scope_builder(egui::UiBuilder::new().max_rect(area.shrink(20.0)), |ui| {
+                    ui.multiply_opacity(reveal);
                     ui.horizontal(|ui| {
                         if !self.sidebar
                             && !narrow
@@ -1955,6 +2179,17 @@ impl eframe::App for App {
         }
         self.flush_chats();
     }
+}
+
+/// Saved chats being read in the background, and when reading began.
+type StartupLoad = (
+    mpsc::Receiver<Result<Option<chat_storage::Archive>, String>>,
+    std::time::Instant,
+);
+
+fn load_archive(path: Option<PathBuf>) -> Result<Option<chat_storage::Archive>, String> {
+    path.ok_or_else(|| "チャット保存先を取得できません".to_owned())
+        .and_then(|path| chat_storage::load(&path))
 }
 
 #[derive(Clone, Copy)]
@@ -2398,6 +2633,63 @@ fn main() -> eframe::Result {
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn wait_for_restore(app: &mut App) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while app.poll_restore() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "startup load did not finish"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+    }
+    #[test]
+    fn startup_restore_runs_in_the_background_and_never_overwrites_the_archive_early() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("chats.json");
+        let saved = Session {
+            label: "saved chat".into(),
+            messages: vec![(true, "question".into()), (false, "answer".into())],
+            ..Default::default()
+        };
+        chat_storage::save(&path, &[saved], 0).unwrap();
+        let original = std::fs::read(&path).unwrap();
+
+        let mut app = App::default();
+        app.save_chats = true;
+        app.archive_path_override = path.to_string_lossy().into_owned();
+        app.start_restore(&egui::Context::default());
+        // Until the result is applied, edits to the startup session are not saved.
+        app.sessions[0].draft = "typed during loading".into();
+        app.sessions_dirty = true;
+        app.flush_chats();
+        assert_eq!(std::fs::read(&path).unwrap(), original);
+
+        wait_for_restore(&mut app);
+        assert_eq!(app.sessions.len(), 1);
+        assert_eq!(app.sessions[0].label, "saved chat");
+        assert!(!app.archive_blocked);
+        assert!(app.storage_error.is_none());
+        assert!(app.startup_load.is_none());
+    }
+    #[test]
+    fn a_broken_archive_found_at_startup_is_reported_and_kept() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("chats.json");
+        std::fs::write(&path, "not json").unwrap();
+        let mut app = App::default();
+        app.save_chats = true;
+        app.archive_path_override = path.to_string_lossy().into_owned();
+        app.start_restore(&egui::Context::default());
+        wait_for_restore(&mut app);
+        assert!(app.archive_blocked);
+        assert!(app.storage_error.is_some());
+        app.sessions_dirty = true;
+        app.flush_chats();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "not json");
+        // A fast load shows no loading state, so there is nothing to cross-fade.
+        assert!(app.reveal.is_none());
+    }
     #[test]
     fn skills_are_added_to_the_request_copy_only_and_missing_skills_block_sending() {
         let dir = tempfile::tempdir().unwrap();

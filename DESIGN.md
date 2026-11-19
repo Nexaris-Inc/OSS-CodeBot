@@ -41,7 +41,7 @@ Colors are Material 3 color roles.
 | Page heading | headline small | 22 logical pixels |
 | Empty title | headline medium | 28 logical pixels |
 
-These tokens live in `crates/codebot-gui/src/main.rs`. The UI has no decorative motion. Keep native egui keyboard and focus behavior for controls; authored line icons are drawn inside actual buttons with accessible names.
+These tokens live in `crates/codebot-gui/src/main.rs`. The UI has no decorative motion. The only startup motion is the loading state below, which reports real work. Keep native egui keyboard and focus behavior for controls; authored line icons are drawn inside actual buttons with accessible names.
 
 ## Layout and behavior
 
@@ -54,6 +54,15 @@ These tokens live in `crates/codebot-gui/src/main.rs`. The UI has no decorative 
 - Settings use the same reading column, not a floating utility window. Changes apply at the next send; Escape returns to the chat.
 - Below 900px, replace the sidebar with a session menu. Support the minimum 700×540 viewport without shrinking text.
 - Below the composer, name the active API destination or state that local processing sends nothing externally. Never show a non-networked claim for API mode. Do not repeat it across header and sidebar.
+
+## Startup loading state
+
+- Saved chats are read on a background thread at startup. Until they are applied, saving, sending and the chat UI stay blocked, so the archive is never overwritten by the empty startup session.
+- For the first 300 ms only the shell's surfaces are drawn (shell, drawer, white pane), with no indicator: a fast load shows no loading state at all.
+- After 300 ms, draw a skeleton of the chat layout (brand, new-chat FAB, search bar, three chat rows, header title, empty-state title and subtitle, composer) in #DADEE6 blocks that breathe between 55% and 100% every 0.9 s, a 3px primary band moving along the pane's top edge every 1.1 s (inside the 16px corners), and the text 保存したチャットを読み込んでいます… for assistive technology.
+- When loading finished after the indicator appeared, the content cross-fades in over 140 ms (cubic out). Repaints are requested only while loading or fading.
+- Settings → 表示 → 動きを減らす stops the pulse, replaces the moving band with a static secondary-container band and skips the cross-fade. It is stored in `gui-preferences.toml`.
+- Fonts are compiled into the binary and are not part of the loading state.
 
 ## Library, skills, connectors and context
 
