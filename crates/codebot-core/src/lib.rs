@@ -71,7 +71,9 @@ use std::{
     fs,
     path::{Path, PathBuf},
 };
-pub use workspace::{citation_location, compose_input, AnalysisAction, Attachment, Workspace};
+pub use workspace::{
+    citation_location, compose_input, AnalysisAction, Attachment, PathMention, SearchHit, Workspace,
+};
 
 #[derive(Clone, Debug, Deserialize)]
 #[serde(default, deny_unknown_fields)]

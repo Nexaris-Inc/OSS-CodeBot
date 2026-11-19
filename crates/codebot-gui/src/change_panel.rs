@@ -384,7 +384,7 @@ mod tests {
     }
 }
 
-fn diff_job(text: &str) -> egui::text::LayoutJob {
+pub(crate) fn diff_job(text: &str) -> egui::text::LayoutJob {
     let mut job = egui::text::LayoutJob::default();
     for line in text.split_inclusive('\n') {
         let color = if line.starts_with("--- ") || line.starts_with("+++ ") {

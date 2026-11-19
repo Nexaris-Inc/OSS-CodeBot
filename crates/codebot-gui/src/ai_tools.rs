@@ -26,6 +26,8 @@ impl Drop for Task {
         }
     }
 }
+const DONE: &str = "回答が完了しました。新しく相談できます。";
+
 /// Everything needed to open the conversation once connector tools are listed.
 struct Start {
     config: Config,
@@ -89,8 +91,88 @@ pub struct ToolPanel {
     kind: u8,
     message: Option<String>,
     markdown: egui_commonmark::CommonMarkCache,
+    /// The conversation ended (final answer, error or stop); read by `take_finished`.
+    finished: bool,
+}
+/// How a chat-started tool conversation ended.
+pub struct Finished {
+    /// The model's text replies, in order.
+    pub replies: Vec<String>,
+    /// Why it stopped early, if it did.
+    pub error: Option<String>,
 }
 impl ToolPanel {
+    /// Start from the chat: `messages` already carry history and skills.
+    #[allow(clippy::too_many_arguments)]
+    pub fn start_chat(
+        &mut self,
+        ctx: &egui::Context,
+        root: &str,
+        messages: Vec<ChatMessage>,
+        connectors: Vec<ConnectorConfig>,
+        config: &Config,
+        backend: Backend,
+        api: &ApiConfig,
+        key: &str,
+    ) -> Result<(), String> {
+        if self.is_busy() {
+            return Err("ツールの操作を処理中です".into());
+        }
+        *self = Self::default();
+        self.root = root.to_owned();
+        self.prompt = messages
+            .last()
+            .map(|m| m.content.clone())
+            .unwrap_or_default();
+        self.connectors = connectors.clone();
+        let start = Start {
+            config: config.clone(),
+            backend,
+            api: api.clone(),
+            key: key.to_owned(),
+            messages,
+        };
+        if connectors.is_empty() {
+            return self.open(ctx, start, &[]);
+        }
+        let root = std::path::PathBuf::from(root);
+        self.start = Some(start);
+        self.listing = Some(spawn(ctx, move |cancel| {
+            let mut tools = Vec::new();
+            for connector in &connectors {
+                let listed = codebot_core::list_connector_tools(connector, Some(&root), cancel)
+                    .map_err(|e| format!("コネクター「{}」：{e}", connector.name))?;
+                tools.extend(listed);
+            }
+            Ok(tools)
+        }));
+        Ok(())
+    }
+    /// Once the conversation has ended and nothing is running, hand back its outcome.
+    pub fn take_finished(&mut self) -> Option<Finished> {
+        if !self.finished || self.is_busy() {
+            return None;
+        }
+        self.finished = false;
+        let error = self.message.take().filter(|m| m != DONE);
+        Some(Finished {
+            replies: std::mem::take(&mut self.replies),
+            error,
+        })
+    }
+    /// Stop waiting for the model and end the conversation.
+    pub fn end(&mut self) {
+        if let Some(task) = &self.task {
+            task.cancel.store(true, Ordering::Relaxed);
+        }
+        if let Some(job) = &self.listing {
+            job.cancel.store(true, Ordering::Relaxed);
+        }
+        if self.task.is_none() && self.listing.is_none() && !self.is_busy() {
+            self.message = Some("ツールの利用を終了しました。".into());
+            self.finished = true;
+        }
+    }
     pub fn take_location(&mut self) -> Option<(String, String)> {
         if self.changes.take_settings_changed() {
             Some(self.changes.last_location().unwrap_or_default())
@@ -227,15 +309,23 @@ impl ToolPanel {
             match (listed, start) {
                 _ if cancelled => {
                     self.message =
-                        Some("コネクターへの接続を中止しました。AIには送信していません。".into())
+                        Some("コネクターへの接続を中止しました。AIには送信していません。".into());
+                    self.finished = true;
                 }
                 (Ok(Ok(tools)), Some(start)) => {
                     if let Err(error) = self.open(ctx, start, &tools) {
                         self.message = Some(error);
+                        self.finished = true;
                     }
                 }
-                (Ok(Err(error)), _) => self.message = Some(error),
-                _ => self.message = Some("コネクターへの接続が中断しました".into()),
+                (Ok(Err(error)), _) => {
+                    self.message = Some(error);
+                    self.finished = true;
+                }
+                _ => {
+                    self.message = Some("コネクターへの接続が中断しました".into());
+                    self.finished = true;
+                }
             }
         }
         if let Some(done) = ready(&self.running) {
@@ -275,7 +365,8 @@ impl ToolPanel {
                     match result {
                         _ if cancelled => {
                             self.message =
-                                Some("ツール相談を中止しました。提案は実行していません。".into())
+                                Some("ツール相談を中止しました。提案は実行していません。".into());
+                            self.finished = true;
                         }
                         Ok(reply) => {
                             let text = reply.text();
@@ -334,14 +425,20 @@ impl ToolPanel {
                                     Err(error) => self.message = Some(error),
                                 }
                             } else {
-                                self.message =
-                                    Some("回答が完了しました。新しく相談できます。".into());
+                                self.message = Some(DONE.into());
+                                self.finished = true;
                             }
                         }
-                        Err(error) => self.message = Some(error),
+                        Err(error) => {
+                            self.message = Some(error);
+                            self.finished = true;
+                        }
                     }
                 }
-                Err(error) => self.message = Some(error.into()),
+                Err(error) => {
+                    self.message = Some(error.into());
+                    self.finished = true;
+                }
             }
         }
         if self.call.is_some() && self.result.is_none() {
@@ -423,6 +520,31 @@ impl ToolPanel {
         if !self.destination.is_empty() {
             ui.add(egui::Label::new(format!("この相談の送信先：{}", self.destination)).wrap());
         }
+        self.progress_ui(ui, can_mutate);
+        if ui
+            .add_enabled(
+                !busy && self.conversation.is_some(),
+                egui::Button::new("相談を終了して新しく始める"),
+            )
+            .clicked()
+        {
+            self.conversation = None;
+            self.call = None;
+            self.connector_call = None;
+            self.result = None;
+            self.replies.clear();
+            self.destination.clear();
+            self.confirm_result = false;
+            self.message = None;
+            self.markdown = Default::default();
+        }
+        if let Some(message) = &self.message {
+            ui.add(egui::Label::new(message).wrap());
+        }
+    }
+    /// Replies, the pending proposal, the result confirmation and stop controls.
+    pub fn progress_ui(&mut self, ui: &mut egui::Ui, can_mutate: bool) {
+        let busy = self.is_busy();
         for (index, text) in self.replies.iter().enumerate() {
             let _ = crate::markdown::show(ui, &mut self.markdown, (usize::MAX - 2, index), text);
         }
@@ -509,26 +631,37 @@ impl ToolPanel {
             ui.ctx()
                 .request_repaint_after(std::time::Duration::from_millis(100));
         }
-        if ui
-            .add_enabled(
-                !busy && self.conversation.is_some(),
-                egui::Button::new("相談を終了して新しく始める"),
-            )
-            .clicked()
-        {
-            self.conversation = None;
-            self.call = None;
-            self.connector_call = None;
-            self.result = None;
-            self.replies.clear();
-            self.destination.clear();
-            self.confirm_result = false;
-            self.message = None;
-            self.markdown = Default::default();
-        }
-        if let Some(message) = &self.message {
-            ui.add(egui::Label::new(message).wrap());
-        }
+    }
+    /// Inline view under the chat messages.
+    pub fn chat_ui(&mut self, ui: &mut egui::Ui, can_mutate: bool) {
+        egui::Frame::new()
+            .stroke(egui::Stroke::new(1.0_f32, crate::BORDER))
+            .corner_radius(12.0)
+            .inner_margin(egui::Margin::symmetric(16, 12))
+            .show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                ui.horizontal(|ui| {
+                    ui.label(
+                        RichText::new("ツールを使って作業中")
+                            .size(14.0)
+                            .family(egui::FontFamily::Name("ui-bold".into())),
+                    );
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui.small_button("ツールの利用を終える").clicked() {
+                            self.end();
+                        }
+                    });
+                });
+                ui.label(
+                    RichText::new("操作ごとに内容を確認し、結果をAIへ送る前にも確認します。最大4操作・8回の通信です。")
+                        .size(12.0)
+                        .color(crate::MUTED),
+                );
+                self.progress_ui(ui, can_mutate);
+                if let Some(message) = self.message.as_ref().filter(|m| m.as_str() != DONE) {
+                    ui.add(egui::Label::new(message).wrap());
+                }
+            });
     }
     fn connector_ui(&mut self, ui: &mut egui::Ui, can_mutate: bool) {
         let Some((config, tool, arguments)) = &self.connector_call else {

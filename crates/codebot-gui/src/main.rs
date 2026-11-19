@@ -58,6 +58,8 @@ const ON_PRIMARY_CONTAINER: Color32 = Color32::from_rgb(0, 29, 54);
 const SELECTED: Color32 = Color32::from_rgb(215, 227, 247);
 const ON_SECONDARY_CONTAINER: Color32 = Color32::from_rgb(16, 28, 43);
 /// on-surface at 12% (container) and 38% (content) for disabled controls.
+/// Dot color for file suggestion chips (matches the attachments segment).
+const ATTACH_DOT: Color32 = Color32::from_rgb(46, 125, 91);
 const DISABLED: Color32 = Color32::from_rgb(225, 226, 230);
 /// Skeleton placeholder blocks shown while startup data loads.
 const SKELETON: Color32 = Color32::from_rgb(218, 222, 230);
@@ -101,6 +103,8 @@ struct Session {
     skills: Vec<String>,
     /// Connector names attached to this chat.
     connectors: Vec<String>,
+    /// Let the model propose changes, commands and connector calls in this chat.
+    use_tools: bool,
 }
 impl Session {
     fn request_messages(
@@ -208,6 +212,12 @@ struct App {
     connectors: Vec<codebot_core::ConnectorConfig>,
     /// (config path, max_context_chars, max_input_chars) for the context meter.
     budget_cache: Option<(String, usize, usize)>,
+    /// Workspace files mentioned in the active draft: (root + draft key, mentions).
+    mention_cache: Option<(String, Vec<codebot_core::PathMention>)>,
+    /// Inline diff previews of proposals in answers, by (session, message).
+    diff_cache: BTreeMap<(usize, usize), Result<Vec<codebot_core::ChangePreview>, String>>,
+    /// A tool conversation started from a chat: (session index, engine).
+    chat_tool: Option<(usize, Box<ai_tools::ToolPanel>)>,
     /// Saved chats being read at startup, and when reading began.
     startup_load: Option<StartupLoad>,
     /// Start of the cross-fade after a visible loading state.
@@ -229,6 +239,9 @@ impl Drop for App {
         self.tool_panel.shutdown();
         self.plugin_panel.shutdown();
         self.library_panel.shutdown();
+        if let Some((_, panel)) = &mut self.chat_tool {
+            panel.shutdown();
+        }
         self.pending = None;
         self.flush_chats();
     }
@@ -278,6 +291,9 @@ impl Default for App {
             library_panel: library::LibraryPanel::default(),
             connectors: Vec::new(),
             budget_cache: None,
+            mention_cache: None,
+            diff_cache: BTreeMap::new(),
+            chat_tool: None,
             startup_load: None,
             reveal: None,
             reduce_motion: false,
@@ -342,6 +358,7 @@ impl App {
         result: Result<Option<chat_storage::Archive>, String>,
         merge: bool,
     ) {
+        self.diff_cache.clear();
         match result {
             Ok(Some(mut archive)) => {
                 for session in &mut archive.sessions {
@@ -420,6 +437,20 @@ impl App {
     fn delete_active_chat(&mut self) {
         if self.pending.is_some() {
             return;
+        }
+        if self
+            .chat_tool
+            .as_ref()
+            .is_some_and(|(_, panel)| panel.is_busy())
+        {
+            return;
+        }
+        // Message keys shift when a chat is removed.
+        self.diff_cache.clear();
+        match &mut self.chat_tool {
+            Some((index, _)) if *index == self.active => self.chat_tool = None,
+            Some((index, _)) if *index > self.active => *index -= 1,
+            _ => {}
         }
         self.sessions.remove(self.active);
         if self.sessions.is_empty() {
@@ -841,6 +872,13 @@ impl App {
                 return;
             }
         }
+        let tool_mode = self.tools_available() && self.sessions[self.active].use_tools;
+        if tool_mode {
+            if let Err(e) = self.start_chat_tool(ctx, &config, messages.clone()) {
+                self.sessions[self.active].notice = Some(e);
+                return;
+            }
+        }
         self.sessions[self.active].notice = None;
         let input = std::mem::take(&mut self.sessions[self.active].draft);
         self.sessions[self.active].in_flight_input = Some(request_input);
@@ -863,6 +901,9 @@ impl App {
         self.sessions[self.active]
             .messages
             .push((true, input.clone()));
+        if tool_mode {
+            return;
+        }
         let backend = self.backend;
         let api = self
             .api_configs
@@ -1052,19 +1093,192 @@ impl App {
         } else if !session.history_enabled {
             history = history.note("履歴送信オフ");
         }
+        let mut segments = vec![skill, history];
+        if session.use_tools && !matches!(self.backend, Backend::Rules | Backend::Local) {
+            let api = self
+                .api_configs
+                .get(&self.backend)
+                .cloned()
+                .unwrap_or_else(|| self.backend.defaults());
+            let tools = context_bar::Segment::new(
+                "ツール定義",
+                codebot_core::tool_definitions_chars(api.resolved(self.backend).protocol, &[]),
+                context_bar::TOOLS,
+            );
+            segments.push(if session.connectors.is_empty() {
+                tools
+            } else {
+                tools.note("コネクター分は接続後に追加")
+            });
+        }
         (
             vec![
-                skill,
-                history,
+                segments.remove(0),
+                segments.remove(0),
                 context_bar::Segment::new(
                     "添付ファイル",
                     attachment_chars,
                     context_bar::ATTACHMENTS,
                 ),
                 context_bar::Segment::new("入力", input_chars, context_bar::INPUT),
-            ],
+            ]
+            .into_iter()
+            .chain(segments)
+            .collect(),
             budget,
         )
+    }
+    /// Tools need an API destination (not local diagnostics or local AI).
+    fn tools_available(&self) -> bool {
+        !matches!(self.backend, Backend::Rules | Backend::Local)
+    }
+    fn start_chat_tool(
+        &mut self,
+        ctx: &egui::Context,
+        config: &Config,
+        messages: Vec<ChatMessage>,
+    ) -> Result<(), String> {
+        let session = &self.sessions[self.active];
+        let root = session
+            .workspace_root
+            .clone()
+            .ok_or("ツールを使うには作業フォルダを選んでください（ヘッダーの「ファイル」）")?;
+        // The request was already validated with skills added; allow its size here.
+        let mut limits = config.clone();
+        limits.max_input_chars = limits
+            .max_input_chars
+            .max(messages.last().map_or(0, |m| m.content.chars().count()));
+        let connectors = self
+            .connectors
+            .iter()
+            .filter(|c| session.connectors.contains(&c.name))
+            .cloned()
+            .collect();
+        let api = self
+            .api_configs
+            .get(&self.backend)
+            .cloned()
+            .unwrap_or_else(|| self.backend.defaults());
+        let mut panel = Box::<ai_tools::ToolPanel>::default();
+        panel.start_chat(
+            ctx,
+            &root,
+            messages,
+            connectors,
+            &limits,
+            self.backend,
+            &api,
+            &self.api_key,
+        )?;
+        self.chat_tool = Some((self.active, panel));
+        Ok(())
+    }
+    /// Poll the chat tool conversation; write its outcome into the chat when it ends.
+    fn poll_chat_tool(&mut self, ctx: &egui::Context) -> Vec<String> {
+        let Some((index, panel)) = &mut self.chat_tool else {
+            return Vec::new();
+        };
+        let roots = panel.poll(ctx);
+        let index = *index;
+        if let Some(done) = panel.take_finished() {
+            self.chat_tool = None;
+            if let Some(session) = self.sessions.get_mut(index) {
+                let mut text = done.replies.join("\n\n");
+                if let Some(error) = &done.error {
+                    if !text.is_empty() {
+                        text.push_str("\n\n---\n");
+                    }
+                    text.push_str(error);
+                }
+                if text.trim().is_empty() {
+                    text = "（回答はありませんでした）".into();
+                }
+                match (done.error, session.in_flight_input.take()) {
+                    (None, Some(input)) => {
+                        session.retry_input = None;
+                        session.history.extend([
+                            ChatMessage::user(input),
+                            ChatMessage::assistant(text.clone()),
+                        ]);
+                    }
+                    (Some(_), input) => session.retry_input = input,
+                    _ => {}
+                }
+                session.messages.push((false, text));
+                self.sessions_dirty = true;
+            }
+        }
+        roots
+    }
+    /// Files from the chat's workspace that the draft mentions and that are not attached.
+    fn mentioned_files(&mut self) -> Vec<codebot_core::PathMention> {
+        let session = &self.sessions[self.active];
+        let Some(root) = session.workspace_root.clone() else {
+            return Vec::new();
+        };
+        let key = format!("{root}\0{}", session.draft);
+        if self.mention_cache.as_ref().map(|(k, _)| k) != Some(&key) {
+            let mentions = if session.draft.contains(['/', '\\', '.']) {
+                codebot_core::Workspace::open(Path::new(&root))
+                    .and_then(|w| w.mentions(&session.draft, 4))
+                    .unwrap_or_default()
+            } else {
+                Vec::new()
+            };
+            self.mention_cache = Some((key, mentions));
+        }
+        let attached: Vec<&str> = session
+            .attachments
+            .iter()
+            .map(|a| a.path.as_str())
+            .collect();
+        self.mention_cache
+            .as_ref()
+            .map(|(_, m)| {
+                m.iter()
+                    .filter(|m| !attached.contains(&m.path.as_str()))
+                    .cloned()
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+    /// Suggest attaching files the draft mentions, e.g. from a pasted stack trace.
+    fn file_suggestions(&mut self, ui: &mut egui::Ui) {
+        let mentions = self.mentioned_files();
+        if mentions.is_empty() {
+            return;
+        }
+        let mut open = None;
+        ui.horizontal_wrapped(|ui| {
+            ui.label(
+                RichText::new("入力にあるファイル：")
+                    .size(12.0)
+                    .color(MUTED),
+            );
+            for mention in &mentions {
+                let label = match mention.line {
+                    Some(line) => format!("{}:{line}", mention.path),
+                    None => mention.path.clone(),
+                };
+                if chip(ui, "開く", &label, ATTACH_DOT)
+                    .on_hover_text("参照ファイル画面で前後の行をプレビューし、添付できます")
+                    .clicked()
+                {
+                    open = Some(mention.clone());
+                }
+            }
+        });
+        if let Some(mention) = open {
+            let root = self.sessions[self.active]
+                .workspace_root
+                .clone()
+                .unwrap_or_default();
+            self.workspace_panel
+                .open_file(&root, &mention.path, mention.line);
+            self.close_pages();
+            self.files_open = true;
+        }
+        ui.add_space(4.0);
     }
     /// (used, budget) when the next request uses 80% or more of the budget.
     fn context_warning(&mut self) -> Option<(usize, usize)> {
@@ -1225,6 +1439,7 @@ impl App {
             self.sessions_dirty = true;
         }
         self.attached_chips(ui);
+        self.file_suggestions(ui);
         let enabled = self.pending.is_none()
             && !self.change_panel.is_busy()
             && !self.command_panel.is_busy()
@@ -1232,6 +1447,7 @@ impl App {
             && !self.github_panel.is_busy()
             && !self.tool_panel.is_busy()
             && !self.plugin_panel.is_busy()
+            && self.chat_tool.is_none()
             && !self.sessions[self.active].draft.trim().is_empty();
         let input_height = 2.0 * ui.text_style_height(&egui::TextStyle::Body);
         egui::Frame::new()
@@ -1386,6 +1602,17 @@ impl App {
                     session.context_key = Some(destination);
                     session.notice = None;
                 }
+                if !matches!(self.backend, Backend::Local)
+                    && ui
+                        .add_enabled(
+                            self.pending.is_none() && self.chat_tool.is_none(),
+                            crate::checkbox::Checkbox::new(&mut session.use_tools, "ツールを使う"),
+                        )
+                        .on_hover_text("変更案・コマンド・追加したコネクターのツールをAIが提案します。実行前と結果送信前に確認します。作業フォルダが必要です。")
+                        .changed()
+                {
+                    self.sessions_dirty = true;
+                }
                 if ui
                     .add_enabled(
                         self.pending.is_none(),
@@ -1417,6 +1644,12 @@ impl App {
         }
     }
     fn conversation(&mut self, ui: &mut egui::Ui) {
+        let can_mutate = !self.change_panel.is_busy()
+            && !self.command_panel.is_busy()
+            && !self.git_panel.is_busy()
+            && !self.github_panel.is_busy()
+            && !self.tool_panel.is_busy()
+            && !self.plugin_panel.is_busy();
         let mut reference = None;
         let mut retry = false;
         let mut proposal_open = None;
@@ -1472,6 +1705,43 @@ impl App {
                         {
                             reference = Some(uri);
                         }
+                        if body.contains("\"changes\"") && body.contains("\"version\"") {
+                            let key = (self.active, index);
+                            let root = self.sessions[self.active].workspace_root.clone();
+                            egui::CollapsingHeader::new("変更案の差分を表示")
+                                .id_salt(("inline-diff", key))
+                                .show(ui, |ui| {
+                                    let Some(root) = root else {
+                                        ui.label(RichText::new("作業フォルダを選ぶと差分を表示できます（「ファイル」で選択）。").size(13.0).color(MUTED));
+                                        return;
+                                    };
+                                    let result = self.diff_cache.entry(key).or_insert_with(|| {
+                                        codebot_core::ChangeProposal::parse(body).and_then(|proposal| {
+                                            codebot_core::prepare_changes(Path::new(&root), &proposal)
+                                                .map(|prepared| prepared.previews())
+                                        })
+                                    });
+                                    match result {
+                                        Ok(previews) => {
+                                            for preview in previews.iter() {
+                                                ui.label(RichText::new(&preview.path).monospace().size(13.0));
+                                                egui::ScrollArea::both()
+                                                    .id_salt(("inline-diff-body", key, &preview.path))
+                                                    .max_height(280.0)
+                                                    .show(ui, |ui| {
+                                                        ui.add(egui::Label::new(change_panel::diff_job(&preview.diff)).extend());
+                                                    });
+                                            }
+                                        }
+                                        Err(error) => {
+                                            ui.colored_label(ERROR, error.as_str());
+                                        }
+                                    }
+                                    if ui.small_button("ファイルの現状で再計算").clicked() {
+                                        self.diff_cache.remove(&key);
+                                    }
+                                });
+                        }
                         ui.add_space(8.0);
                         ui.horizontal(|ui| {
                             if icon_button(ui, Icon::Copy, "回答をコピー", true, false).clicked()
@@ -1502,6 +1772,12 @@ impl App {
                         });
                     }
                     ui.add_space(14.0);
+                }
+                if let Some((index, panel)) = &mut self.chat_tool {
+                    if *index == self.active {
+                        ui.add_space(16.0);
+                        panel.chat_ui(ui, can_mutate);
+                    }
                 }
                 if self
                     .pending
@@ -1803,6 +2079,7 @@ impl eframe::App for App {
         .flatten()
         .chain(self.tool_panel.poll(ctx))
         .chain(self.plugin_panel.poll(ctx))
+        .chain(self.poll_chat_tool(ctx))
         {
             for session in &mut self.sessions {
                 if session.workspace_root.as_deref() == Some(&root) {
@@ -2006,7 +2283,7 @@ impl eframe::App for App {
                             {
                                 self.new_chat();
                             }
-                            if tab_button(ui, "ファイル", self.files_open).clicked() { self.files_open = !self.files_open; self.settings = false; self.changes_open = false; self.commands_open = false; self.git_open=false; self.github_open=false; self.tools_open=false;self.plugins_open=false; self.library_open = false; }
+                            if tab_button(ui, "ファイル", self.files_open).clicked() { self.workspace_panel.set_root_if_empty(self.sessions[self.active].workspace_root.as_deref()); self.files_open = !self.files_open; self.settings = false; self.changes_open = false; self.commands_open = false; self.git_open=false; self.github_open=false; self.tools_open=false;self.plugins_open=false; self.library_open = false; }
                             if tab_button(ui, "ライブラリ", self.library_open).clicked() {
                                 let open = !self.library_open;
                                 self.close_pages();
@@ -2199,7 +2476,8 @@ impl eframe::App for App {
                         let session = &self.sessions[self.active];
                         let extra = extra
                             + if session.skills.is_empty() && session.connectors.is_empty() { 0.0 } else { 40.0 }
-                            + if self.context_warning().is_some() { 36.0 } else { 0.0 };
+                            + if self.context_warning().is_some() { 36.0 } else { 0.0 }
+                            + if self.mentioned_files().is_empty() { 0.0 } else { 40.0 };
                         let composer_top =
                             (bounds.bottom() - 108.0 - extra).max(bounds.top() + 80.0);
                         let history = egui::Rect::from_min_max(
@@ -2713,6 +2991,99 @@ mod tests {
         assert_eq!(app.context_warning(), Some((85, 100)));
         app.backend = Backend::Rules;
         assert!(app.context_warning().is_none());
+    }
+    /// Serve one canned JSON response per connection on a local port.
+    fn mock_api(
+        responses: Vec<serde_json::Value>,
+    ) -> (String, std::thread::JoinHandle<Vec<serde_json::Value>>) {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/v1", listener.local_addr().unwrap());
+        let join = std::thread::spawn(move || {
+            let mut requests = Vec::new();
+            for response in responses {
+                let (mut socket, _) = listener.accept().unwrap();
+                let mut raw = Vec::new();
+                let mut byte = [0];
+                while !raw.ends_with(b"\r\n\r\n") {
+                    socket.read_exact(&mut byte).unwrap();
+                    raw.push(byte[0]);
+                }
+                let header = String::from_utf8(raw).unwrap().to_lowercase();
+                let size: usize = header
+                    .lines()
+                    .find_map(|l| {
+                        l.strip_prefix("content-length:")
+                            .map(|v| v.trim().parse().unwrap())
+                    })
+                    .unwrap();
+                let mut body = vec![0; size];
+                socket.read_exact(&mut body).unwrap();
+                requests.push(serde_json::from_slice(&body).unwrap());
+                let bytes = serde_json::to_vec(&response).unwrap();
+                write!(socket, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", bytes.len()).unwrap();
+                socket.write_all(&bytes).unwrap();
+            }
+            requests
+        });
+        (url, join)
+    }
+    #[test]
+    fn chat_with_tools_runs_through_the_tool_engine_and_records_the_answer() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = dir.path().join("config.toml");
+        std::fs::write(&config, "provider = \"rules\"\n").unwrap();
+        let (url, server) = mock_api(vec![serde_json::json!({
+            "choices": [{"finish_reason": "stop", "message": {"content": "ツールは不要でした。"}}]
+        })]);
+        let mut app = App::default();
+        app.config_path = config.to_string_lossy().into_owned();
+        app.backend = Backend::Custom;
+        app.api_configs.insert(
+            Backend::Custom,
+            ApiConfig {
+                base_url: url,
+                model: "mock".into(),
+                anonymous: true,
+                ..Default::default()
+            },
+        );
+        app.sessions[0].use_tools = true;
+        app.sessions[0].draft = "READMEを直して".into();
+        let ctx = egui::Context::default();
+
+        // Without a workspace the draft is kept and nothing is sent.
+        app.send(&ctx);
+        assert!(app.chat_tool.is_none());
+        assert_eq!(app.sessions[0].draft, "READMEを直して");
+        assert!(app.sessions[0]
+            .notice
+            .as_deref()
+            .unwrap()
+            .contains("作業フォルダ"));
+
+        app.sessions[0].workspace_root = Some(dir.path().to_string_lossy().into_owned());
+        app.send(&ctx);
+        assert!(app.chat_tool.is_some());
+        assert!(app.sessions[0].draft.is_empty());
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while app.chat_tool.is_some() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "tool conversation did not finish"
+            );
+            let _ = app.poll_chat_tool(&ctx);
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let session = &app.sessions[0];
+        assert_eq!(
+            session.messages.last().unwrap(),
+            &(false, "ツールは不要でした。".to_owned())
+        );
+        assert_eq!(session.history.len(), 2);
+        assert_eq!(session.history[0].content, "READMEを直して");
+        let requests = server.join().unwrap();
+        assert_eq!(requests[0]["tools"].as_array().unwrap().len(), 2);
     }
     fn wait_for_restore(app: &mut App) {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
