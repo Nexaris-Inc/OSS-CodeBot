@@ -129,7 +129,7 @@ impl LibraryPanel {
         ui.add(
             egui::Label::new(
                 RichText::new("スキルとコネクターを、このチャットに追加して使います。")
-                    .color(crate::MUTED),
+                    .color(crate::MUTED()),
             )
             .wrap(),
         );
@@ -162,7 +162,7 @@ impl LibraryPanel {
             egui::Label::new(
                 RichText::new("SKILL.md（name・descriptionの前置きと手順）を読み込みます。追加したスキルの本文は、送信時に依頼の前へ付けてAIに渡します。ローカル診断では使いません。スクリプト等は実行しません。")
                     .size(13.0)
-                    .color(crate::MUTED),
+                    .color(crate::MUTED()),
             )
             .wrap(),
         );
@@ -170,7 +170,7 @@ impl LibraryPanel {
         if self.skills.is_empty() {
             ui.label(
                 RichText::new("スキルはまだありません。下のフォルダ指定から取り込めます。")
-                    .color(crate::MUTED),
+                    .color(crate::MUTED()),
             );
         }
         let mut remove = None;
@@ -185,7 +185,7 @@ impl LibraryPanel {
                     ui.label(
                         RichText::new(skill.source.label())
                             .size(12.0)
-                            .color(crate::MUTED),
+                            .color(crate::MUTED()),
                     );
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         if skill.source == SkillSource::Library {
@@ -228,7 +228,7 @@ impl LibraryPanel {
                         skill.path.display()
                     ))
                     .size(11.0)
-                    .color(crate::MUTED),
+                    .color(crate::MUTED()),
                 );
             });
         }
@@ -255,7 +255,7 @@ impl LibraryPanel {
         if !missing.is_empty() {
             ui.horizontal_wrapped(|ui| {
                 ui.colored_label(
-                    crate::ERROR,
+                    crate::ERROR(),
                     format!("見つからないスキル：{}", missing.join("、")),
                 );
                 if ui.small_button("このチャットから外す").clicked() {
@@ -274,7 +274,7 @@ impl LibraryPanel {
                 import = ui.button("取り込む").clicked();
                 ui.add(
                     crate::text_field(&mut self.import_path)
-                        .hint_text(RichText::new("/path/to/my-skill").color(crate::MUTED))
+                        .hint_text(RichText::new("/path/to/my-skill").color(crate::MUTED()))
                         .desired_width(ui.available_width()),
                 );
             });
@@ -304,7 +304,7 @@ impl LibraryPanel {
                         dir.display()
                     ))
                     .size(11.0)
-                    .color(crate::MUTED),
+                    .color(crate::MUTED()),
                 )
                 .wrap(),
             );
@@ -339,13 +339,13 @@ impl LibraryPanel {
             egui::Label::new(
                 RichText::new("ローカルのMCPサーバー（標準入出力）を登録します。追加したコネクターのツールは「実行 → AIに作業を相談」でAIに提示し、呼び出しごとに内容を確認してから実行します。起動時の環境変数はPATH等の基本項目と、指定した変数名だけを渡します。")
                     .size(13.0)
-                    .color(crate::MUTED),
+                    .color(crate::MUTED()),
             )
             .wrap(),
         );
         ui.add_space(8.0);
         if connectors.is_empty() {
-            ui.label(RichText::new("コネクターはまだありません。").color(crate::MUTED));
+            ui.label(RichText::new("コネクターはまだありません。").color(crate::MUTED()));
         }
         let busy = self.test.is_some();
         let mut remove = None;
@@ -412,7 +412,7 @@ impl LibraryPanel {
                         connector.timeout_seconds
                     ))
                     .size(11.0)
-                    .color(crate::MUTED),
+                    .color(crate::MUTED()),
                 );
                 match self.tested.get(&connector.name) {
                     Some(Ok(tools)) => {
@@ -432,7 +432,7 @@ impl LibraryPanel {
                         });
                     }
                     Some(Err(error)) => {
-                        ui.colored_label(crate::ERROR, error);
+                        ui.colored_label(crate::ERROR(), error);
                     }
                     None => {}
                 }
@@ -472,7 +472,7 @@ impl LibraryPanel {
             ui.label(RichText::new("実行ファイル").size(13.0));
             ui.add(
                 crate::text_field(&mut self.form_command)
-                    .hint_text(RichText::new("npx / uvx / /path/to/server").color(crate::MUTED))
+                    .hint_text(RichText::new("npx / uvx / /path/to/server").color(crate::MUTED()))
                     .desired_width(f32::INFINITY),
             );
             ui.label(RichText::new("引数（1行に1つ）").size(13.0));
@@ -545,7 +545,7 @@ fn section_title(ui: &mut egui::Ui, text: &str) {
 /// Material outlined card.
 fn card(ui: &mut egui::Ui, add: impl FnOnce(&mut egui::Ui)) {
     egui::Frame::new()
-        .stroke(egui::Stroke::new(1.0_f32, crate::BORDER))
+        .stroke(egui::Stroke::new(1.0_f32, crate::BORDER()))
         .corner_radius(12.0)
         .inner_margin(egui::Margin::symmetric(16, 12))
         .show(ui, |ui| {

@@ -16,6 +16,8 @@ mod api_diagnostics;
 mod change_panel;
 mod chat_storage;
 mod checkbox;
+mod theme;
+pub(crate) use theme::*;
 mod command_panel;
 mod context_bar;
 mod git_panel;
@@ -33,39 +35,6 @@ use local_models::LocalModels;
 use ui_preferences::{apply_font, FontChoice, UiPreferences};
 
 // Material Design 3 color roles (light scheme generated around the #005FB8 brand primary).
-/// surface-container: navigation drawer and window background.
-const SHELL: Color32 = Color32::from_rgb(236, 238, 244);
-/// surface-container-lowest: the reading pane.
-const SURFACE: Color32 = Color32::WHITE;
-/// surface-container-high: composer and filled text fields.
-const RAISED: Color32 = Color32::from_rgb(230, 232, 238);
-/// outline-variant: dividers.
-const BORDER: Color32 = Color32::from_rgb(195, 199, 207);
-/// on-surface.
-const TEXT: Color32 = Color32::from_rgb(25, 28, 32);
-/// on-surface-variant.
-const MUTED: Color32 = Color32::from_rgb(67, 71, 78);
-/// outline: unselected selection controls.
-const OUTLINE: Color32 = Color32::from_rgb(115, 119, 127);
-/// primary.
-const ACCENT: Color32 = Color32::from_rgb(0, 95, 184);
-/// primary with an 8% on-primary hover state layer.
-const ACCENT_HOVER: Color32 = Color32::from_rgb(20, 108, 190);
-/// primary-container / on-primary-container: user messages and the FAB.
-const PRIMARY_CONTAINER: Color32 = Color32::from_rgb(209, 228, 255);
-const ON_PRIMARY_CONTAINER: Color32 = Color32::from_rgb(0, 29, 54);
-/// secondary-container: navigation indicator, selected rows, tonal buttons.
-const SELECTED: Color32 = Color32::from_rgb(215, 227, 247);
-const ON_SECONDARY_CONTAINER: Color32 = Color32::from_rgb(16, 28, 43);
-/// on-surface at 12% (container) and 38% (content) for disabled controls.
-/// Dot color for file suggestion chips (matches the attachments segment).
-const ATTACH_DOT: Color32 = Color32::from_rgb(46, 125, 91);
-const DISABLED: Color32 = Color32::from_rgb(225, 226, 230);
-/// Skeleton placeholder blocks shown while startup data loads.
-const SKELETON: Color32 = Color32::from_rgb(218, 222, 230);
-const DISABLED_CONTENT: Color32 = Color32::from_rgb(160, 162, 166);
-/// error.
-const ERROR: Color32 = Color32::from_rgb(186, 26, 26);
 /// Shape scale: full (pill) buttons, large panes, extra-large composer.
 const SHAPE_FULL: u8 = 255;
 const SHAPE_LARGE: f32 = 16.0;
@@ -215,7 +184,7 @@ struct App {
     /// Workspace files mentioned in the active draft: (root + draft key, mentions).
     mention_cache: Option<(String, Vec<codebot_core::PathMention>)>,
     /// Inline diff previews of proposals in answers, by (session, message).
-    diff_cache: BTreeMap<(usize, usize), Result<Vec<codebot_core::ChangePreview>, String>>,
+    diff_cache: BTreeMap<(usize, usize), DiffPreview>,
     /// A tool conversation started from a chat: (session index, engine).
     chat_tool: Option<(usize, Box<ai_tools::ToolPanel>)>,
     /// Saved chats being read at startup, and when reading began.
@@ -224,6 +193,7 @@ struct App {
     reveal: Option<std::time::Instant>,
     /// Stop the skeleton pulse, progress bar motion and cross-fade.
     reduce_motion: bool,
+    theme: theme::ThemeChoice,
     plugin_panel: plugins::PluginPanel,
     tool_panel: ai_tools::ToolPanel,
     github_panel: github_panel::GithubPanel,
@@ -297,6 +267,7 @@ impl Default for App {
             startup_load: None,
             reveal: None,
             reduce_motion: false,
+            theme: theme::ThemeChoice::default(),
             plugin_panel: plugins::PluginPanel::default(),
             tool_panel: ai_tools::ToolPanel::default(),
             github_panel: github_panel::GithubPanel::default(),
@@ -614,6 +585,7 @@ impl App {
                     app.github_panel.config = preferences.github;
                     app.connectors = preferences.connectors;
                     app.reduce_motion = preferences.reduce_motion;
+                    app.theme = preferences.theme;
                     app.save_chats = preferences.save_chats;
                     app.archive_path_override = preferences.chat_archive_path;
                     app.archive_path_edit = app.archive_path_override.clone();
@@ -651,6 +623,7 @@ impl App {
                 github: self.github_panel.config.clone(),
                 connectors: self.connectors.clone(),
                 reduce_motion: self.reduce_motion,
+                theme: self.theme,
             }
             .save(path)
             .err(),
@@ -680,14 +653,14 @@ impl App {
         } else {
             0.775 + 0.225 * (seconds * std::f32::consts::TAU / 0.9).cos()
         };
-        let block = SKELETON.gamma_multiply(alpha);
+        let block = SKELETON().gamma_multiply(alpha);
         let narrow = ctx.screen_rect().width() < 900.0;
         if self.sidebar && !narrow {
             egui::SidePanel::left("sidebar")
                 .exact_width(224.0)
                 .resizable(false)
                 .show_separator_line(false)
-                .frame(egui::Frame::new().fill(SHELL).inner_margin(egui::Margin {
+                .frame(egui::Frame::new().fill(SHELL()).inner_margin(egui::Margin {
                     left: 12,
                     right: 12,
                     top: 16,
@@ -720,10 +693,10 @@ impl App {
                 });
         }
         egui::CentralPanel::default()
-            .frame(egui::Frame::new().fill(SHELL).inner_margin(8.0))
+            .frame(egui::Frame::new().fill(SHELL()).inner_margin(8.0))
             .show(ctx, |ui| {
                 let area = ui.max_rect();
-                ui.painter().rect_filled(area, SHAPE_LARGE, SURFACE);
+                ui.painter().rect_filled(area, SHAPE_LARGE, SURFACE());
                 if !visible {
                     return;
                 }
@@ -734,7 +707,7 @@ impl App {
                 // Progress: a 3px band along the pane's top edge.
                 let track = egui::Rect::from_min_size(area.min, egui::vec2(area.width(), 3.0));
                 if self.reduce_motion {
-                    p.rect_filled(track, 0.0, SELECTED);
+                    p.rect_filled(track, 0.0, SELECTED());
                 } else {
                     let phase = (seconds / 1.1).fract();
                     let width = area.width() * 0.35;
@@ -745,7 +718,7 @@ impl App {
                             egui::vec2(width, 3.0),
                         ),
                         1.5,
-                        ACCENT,
+                        ACCENT(),
                     );
                 }
                 let inner = area.shrink(20.0);
@@ -779,7 +752,7 @@ impl App {
                         ui.label(
                             RichText::new("保存したチャットを読み込んでいます…")
                                 .size(12.0)
-                                .color(MUTED),
+                                .color(MUTED()),
                         );
                     },
                 );
@@ -1082,12 +1055,12 @@ impl App {
         let attachment_chars = codebot_core::compose_input(&input, &session.attachments)
             .map(|t| t.chars().count().saturating_sub(input_chars))
             .unwrap_or(0);
-        let mut skill = context_bar::Segment::new("スキル", skill_chars, context_bar::SKILLS);
+        let mut skill = context_bar::Segment::new("スキル", skill_chars, context_bar::SKILLS());
         if rules && skill_chars > 0 {
             skill = skill.note("ローカル診断では未使用");
         }
         let mut history =
-            context_bar::Segment::new("会話履歴", history_chars, context_bar::HISTORY);
+            context_bar::Segment::new("会話履歴", history_chars, context_bar::HISTORY());
         if rules {
             history = history.note("ローカル診断では未使用");
         } else if !session.history_enabled {
@@ -1103,7 +1076,7 @@ impl App {
             let tools = context_bar::Segment::new(
                 "ツール定義",
                 codebot_core::tool_definitions_chars(api.resolved(self.backend).protocol, &[]),
-                context_bar::TOOLS,
+                context_bar::TOOLS(),
             );
             segments.push(if session.connectors.is_empty() {
                 tools
@@ -1118,9 +1091,9 @@ impl App {
                 context_bar::Segment::new(
                     "添付ファイル",
                     attachment_chars,
-                    context_bar::ATTACHMENTS,
+                    context_bar::ATTACHMENTS(),
                 ),
-                context_bar::Segment::new("入力", input_chars, context_bar::INPUT),
+                context_bar::Segment::new("入力", input_chars, context_bar::INPUT()),
             ]
             .into_iter()
             .chain(segments)
@@ -1253,14 +1226,14 @@ impl App {
             ui.label(
                 RichText::new("入力にあるファイル：")
                     .size(12.0)
-                    .color(MUTED),
+                    .color(MUTED()),
             );
             for mention in &mentions {
                 let label = match mention.line {
                     Some(line) => format!("{}:{line}", mention.path),
                     None => mention.path.clone(),
                 };
-                if chip(ui, "開く", &label, ATTACH_DOT)
+                if chip(ui, "開く", &label, ATTACHMENTS(), false)
                     .on_hover_text("参照ファイル画面で前後の行をプレビューし、添付できます")
                     .clicked()
                 {
@@ -1299,7 +1272,7 @@ impl App {
         let mut remove_connector = None;
         ui.horizontal_wrapped(|ui| {
             for name in &session.skills {
-                if chip(ui, "スキル", name, context_bar::SKILLS)
+                if chip(ui, "スキル", name, context_bar::SKILLS(), true)
                     .on_hover_text("送信時にスキルの指示を依頼の前に付けます")
                     .clicked()
                 {
@@ -1307,7 +1280,7 @@ impl App {
                 }
             }
             for name in &session.connectors {
-                if chip(ui, "コネクター", name, context_bar::TOOLS)
+                if chip(ui, "コネクター", name, context_bar::TOOLS(), true)
                     .on_hover_text("「実行 → AIに作業を相談」でツールをAIに提示します")
                     .clicked()
                 {
@@ -1348,12 +1321,12 @@ impl App {
             |ui| {
                 ui.set_min_width(260.0);
                 let session = &mut self.sessions[self.active];
-                ui.label(RichText::new("スキル").size(12.0).color(MUTED));
+                ui.label(RichText::new("スキル").size(12.0).color(MUTED()));
                 if self.library_panel.skills.is_empty() {
                     ui.label(
                         RichText::new("ライブラリにスキルがありません")
                             .size(13.0)
-                            .color(MUTED),
+                            .color(MUTED()),
                     );
                 }
                 for skill in &self.library_panel.skills {
@@ -1371,12 +1344,12 @@ impl App {
                     }
                 }
                 ui.separator();
-                ui.label(RichText::new("コネクター").size(12.0).color(MUTED));
+                ui.label(RichText::new("コネクター").size(12.0).color(MUTED()));
                 if self.connectors.is_empty() {
                     ui.label(
                         RichText::new("登録済みのコネクターがありません")
                             .size(13.0)
-                            .color(MUTED),
+                            .color(MUTED()),
                     );
                 }
                 for connector in &self.connectors {
@@ -1410,7 +1383,7 @@ impl App {
         for (index, attachment) in self.sessions[self.active].attachments.iter().enumerate() {
             // Material input chip.
             egui::Frame::new()
-                .stroke(egui::Stroke::new(1.0_f32, BORDER))
+                .stroke(egui::Stroke::new(1.0_f32, BORDER()))
                 .corner_radius(8.0)
                 .inner_margin(egui::Margin {
                     left: 12,
@@ -1426,7 +1399,7 @@ impl App {
                                 attachment.path, attachment.first_line, attachment.last_line
                             ))
                             .size(14.0)
-                            .color(MUTED),
+                            .color(MUTED()),
                         );
                         if ui.small_button("外す").clicked() {
                             remove = Some(index);
@@ -1451,7 +1424,7 @@ impl App {
             && !self.sessions[self.active].draft.trim().is_empty();
         let input_height = 2.0 * ui.text_style_height(&egui::TextStyle::Body);
         egui::Frame::new()
-            .fill(RAISED)
+            .fill(RAISED())
             .corner_radius(SHAPE_EXTRA_LARGE)
             .inner_margin(egui::Margin::symmetric(18, 16))
             .show(ui, |ui| {
@@ -1474,7 +1447,7 @@ impl App {
                                         crate::text_area(&mut self.sessions[self.active].draft)
                                             .id_salt(("draft", self.active))
                                             .hint_text(
-                                                RichText::new("メッセージを入力").color(MUTED),
+                                                RichText::new("メッセージを入力").color(MUTED()),
                                             )
                                             .font(egui::TextStyle::Body)
                                             .desired_width(f32::INFINITY)
@@ -1532,7 +1505,7 @@ impl App {
                     }
                 )
             };
-            ui.label(RichText::new(notice).size(12.0).color(MUTED));
+            ui.label(RichText::new(notice).size(12.0).color(MUTED()));
             let (segments, budget) = self.context_segments();
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if ui.available_width() > 220.0 {
@@ -1543,7 +1516,7 @@ impl App {
                             "Ctrl + Enter"
                         })
                         .size(11.0)
-                        .color(MUTED),
+                        .color(MUTED()),
                     );
                     ui.add_space(8.0);
                 }
@@ -1563,7 +1536,7 @@ impl App {
                         "コンテキストが上限の80%を超えました。"
                     })
                     .size(12.0)
-                    .color(if used > budget { ERROR } else { MUTED }),
+                    .color(if used > budget { ERROR() } else { MUTED() }),
                 );
                 if session.history_enabled && session.history.len() >= 2 {
                     let others = used.saturating_sub(history_chars(&session.history));
@@ -1580,7 +1553,7 @@ impl App {
                         self.sessions_dirty = true;
                     }
                 } else if !session.attachments.is_empty() {
-                    ui.label(RichText::new("添付する行の範囲を狭めると減らせます。").size(12.0).color(MUTED));
+                    ui.label(RichText::new("添付する行の範囲を狭めると減らせます。").size(12.0).color(MUTED()));
                 }
             });
         }
@@ -1635,12 +1608,12 @@ impl App {
                             .sum::<usize>()
                     ))
                     .size(12.0)
-                    .color(MUTED),
+                    .color(MUTED()),
                 );
             });
         }
         if let Some(notice) = &self.sessions[self.active].notice {
-            ui.label(RichText::new(notice).size(12.0).color(MUTED));
+            ui.label(RichText::new(notice).size(12.0).color(MUTED()));
         }
     }
     fn conversation(&mut self, ui: &mut egui::Ui) {
@@ -1667,7 +1640,7 @@ impl App {
                         ui.horizontal(|ui| {
                             ui.add_space((ui.available_width() - width - 10.0).max(0.0));
                             egui::Frame::new()
-                                .fill(PRIMARY_CONTAINER)
+                                .fill(PRIMARY_CONTAINER())
                                 .corner_radius(egui::CornerRadius {
                                     nw: 20,
                                     ne: 20,
@@ -1681,7 +1654,7 @@ impl App {
                                         egui::Label::new(
                                             RichText::new(message)
                                                 .line_height(Some(22.0))
-                                                .color(ON_PRIMARY_CONTAINER),
+                                                .color(ON_PRIMARY_CONTAINER()),
                                         )
                                         .wrap()
                                         .selectable(true),
@@ -1712,7 +1685,7 @@ impl App {
                                 .id_salt(("inline-diff", key))
                                 .show(ui, |ui| {
                                     let Some(root) = root else {
-                                        ui.label(RichText::new("作業フォルダを選ぶと差分を表示できます（「ファイル」で選択）。").size(13.0).color(MUTED));
+                                        ui.label(RichText::new("作業フォルダを選ぶと差分を表示できます（「ファイル」で選択）。").size(13.0).color(MUTED()));
                                         return;
                                     };
                                     let result = self.diff_cache.entry(key).or_insert_with(|| {
@@ -1734,7 +1707,7 @@ impl App {
                                             }
                                         }
                                         Err(error) => {
-                                            ui.colored_label(ERROR, error.as_str());
+                                            ui.colored_label(ERROR(), error.as_str());
                                         }
                                     }
                                     if ui.small_button("ファイルの現状で再計算").clicked() {
@@ -1750,7 +1723,7 @@ impl App {
                                 self.copied = Some((self.active, index));
                             }
                             if self.copied == Some((self.active, index)) {
-                                ui.label(RichText::new("コピーしました").size(12.0).color(MUTED));
+                                ui.label(RichText::new("コピーしました").size(12.0).color(MUTED()));
                             }
                             if body.contains("\"changes\"")
                                 && body.contains("\"version\"")
@@ -1785,7 +1758,7 @@ impl App {
                     .is_some_and(|(id, _)| *id == self.active)
                 {
                     ui.add_space(20.0);
-                    ui.label(RichText::new("生成中…").color(MUTED));
+                    ui.label(RichText::new("生成中…").color(MUTED()));
                 }
             });
         if let Some(uri) = reference {
@@ -1867,7 +1840,7 @@ impl App {
             ui.label(
                 RichText::new("APIキー不要。入力は外部に送信されません。")
                     .size(13.0)
-                    .color(MUTED),
+                    .color(MUTED()),
             );
             return;
         }
@@ -1924,7 +1897,7 @@ impl App {
                 }
             })
             .size(12.0)
-            .color(MUTED),
+            .color(MUTED()),
         );
         ui.add_space(8.0);
         let key = ui.label("APIキー（保存されません）");
@@ -1951,7 +1924,7 @@ impl App {
             ui.add(egui::DragValue::new(&mut api.timeout_seconds).range(1..=300));
         });
         ui.add_space(8.0);
-        ui.label(RichText::new("送信時は今回の入力と選択した添付を上記URLに送ります。履歴送信を有効にした場合は過去の会話も含みます。利用料金は各サービスに従います。").size(12.0).color(MUTED));
+        ui.label(RichText::new("送信時は今回の入力と選択した添付を上記URLに送ります。履歴送信を有効にした場合は過去の会話も含みます。利用料金は各サービスに従います。").size(12.0).color(MUTED()));
         self.api_diagnostics
             .ui(ui, self.backend, api, &self.api_key, self.pending.is_none());
         if ui.button("API設定を保存").clicked() {
@@ -1996,7 +1969,7 @@ impl App {
             ui.label(
                 RichText::new("すぐに反映され、次回起動にも引き継がれます。")
                     .size(13.0)
-                    .color(MUTED),
+                    .color(MUTED()),
             );
         }
         ui.add_space(28.0);
@@ -2005,6 +1978,20 @@ impl App {
                 .size(14.0)
                 .family(egui::FontFamily::Name("ui-bold".into())),
         );
+        let previous = self.theme;
+        ui.horizontal_wrapped(|ui| {
+            for (choice, label) in [
+                (theme::ThemeChoice::Light, "ライト（標準）"),
+                (theme::ThemeChoice::Dark, "ダーク"),
+                (theme::ThemeChoice::System, "OSに合わせる"),
+            ] {
+                ui.add(crate::checkbox::Radio::new(&mut self.theme, choice, label));
+            }
+        });
+        if self.theme != previous {
+            theme::apply(ui.ctx(), theme::wants_dark(ui.ctx(), self.theme));
+            self.save_preferences();
+        }
         if ui
             .add(crate::checkbox::Checkbox::new(
                 &mut self.reduce_motion,
@@ -2019,7 +2006,7 @@ impl App {
                 "起動時の読み込み表示で、明滅・進捗バーの移動・切り替え時のフェードを止めます。",
             )
             .size(13.0)
-            .color(MUTED),
+            .color(MUTED()),
         );
         ui.add_space(28.0);
         let label = ui.label(
@@ -2030,7 +2017,7 @@ impl App {
         ui.label(
             RichText::new("使用するTOMLファイルのパスを指定します。")
                 .size(13.0)
-                .color(MUTED),
+                .color(MUTED()),
         );
         ui.add_space(8.0);
         ui.add(
@@ -2041,7 +2028,7 @@ impl App {
         )
         .labelled_by(label.id);
         ui.add_space(8.0);
-        ui.label(RichText::new("空欄の場合はOS標準の設定、または既定値を使います。\n変更は次の送信から適用されます。").size(13.0).color(MUTED));
+        ui.label(RichText::new("空欄の場合はOS標準の設定、または既定値を使います。\n変更は次の送信から適用されます。").size(13.0).color(MUTED()));
         ui.add_space(28.0);
         if ui.button("チャットに戻る").clicked() {
             self.settings = false;
@@ -2050,6 +2037,11 @@ impl App {
 }
 impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _: &mut eframe::Frame) {
+        // "OSに合わせる" follows the OS preference while the app runs.
+        let dark = theme::wants_dark(ctx, self.theme);
+        if dark != theme::is_dark() {
+            theme::apply(ctx, dark);
+        }
         if self.poll_restore() {
             self.loading_ui(ctx);
             return;
@@ -2130,7 +2122,7 @@ impl eframe::App for App {
                 .exact_width(224.0)
                 .resizable(false)
                 .show_separator_line(false)
-                .frame(egui::Frame::new().fill(SHELL).inner_margin(egui::Margin {
+                .frame(egui::Frame::new().fill(SHELL()).inner_margin(egui::Margin {
                     left: 12,
                     right: 12,
                     top: 16,
@@ -2163,7 +2155,7 @@ impl eframe::App for App {
                     ui.add_space(16.0);
                     ui.horizontal(|ui| {
                         ui.add_space(16.0);
-                        ui.label(RichText::new("チャット").size(14.0).color(MUTED));
+                        ui.label(RichText::new("チャット").size(14.0).color(MUTED()));
                     });
                     ui.add_space(2.0);
                     egui::ScrollArea::vertical()
@@ -2212,7 +2204,7 @@ impl eframe::App for App {
                                     "履歴は終了時に消去されます"
                                 })
                                 .size(12.0)
-                                .color(MUTED),
+                                .color(MUTED()),
                             );
                         });
                         ui.add_space(8.0);
@@ -2231,10 +2223,10 @@ impl eframe::App for App {
                 });
         }
         egui::CentralPanel::default()
-            .frame(egui::Frame::new().fill(SHELL).inner_margin(8.0))
+            .frame(egui::Frame::new().fill(SHELL()).inner_margin(8.0))
             .show(ctx, |ui| {
                 let area = ui.max_rect();
-                ui.painter().rect_filled(area, SHAPE_LARGE, SURFACE);
+                ui.painter().rect_filled(area, SHAPE_LARGE, SURFACE());
                 ui.scope_builder(egui::UiBuilder::new().max_rect(area.shrink(20.0)), |ui| {
                     ui.multiply_opacity(reveal);
                     ui.horizontal(|ui| {
@@ -2313,7 +2305,7 @@ impl eframe::App for App {
                             if tab_button(ui, "Git", self.git_open).clicked() { self.git_open=!self.git_open; self.github_open=false; self.tools_open=false;self.plugins_open=false; self.library_open = false; self.settings=false; self.files_open=false; self.changes_open=false; self.commands_open=false; self.git_panel.set_initial_root(self.sessions[self.active].workspace_root.as_deref()); }
                             if tab_button(ui, "GitHub", self.github_open).clicked() { self.github_open=!self.github_open;self.tools_open=false;self.plugins_open=false; self.library_open = false; self.git_open=false; self.settings=false; self.files_open=false; self.changes_open=false; self.commands_open=false; }
                             ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
-                                ui.add(egui::Label::new(RichText::new(title).size(16.0).color(TEXT)).truncate());
+                                ui.add(egui::Label::new(RichText::new(title).size(16.0).color(TEXT())).truncate());
                             });
                         });
                     });
@@ -2457,7 +2449,7 @@ impl eframe::App for App {
                             ui.label(
                                 RichText::new("コードやログを一緒に確認しましょう。")
                                     .size(14.0)
-                                    .color(MUTED),
+                                    .color(MUTED()),
                             );
                             ui.add_space(28.0);
                             self.composer(ui);
@@ -2504,6 +2496,9 @@ impl eframe::App for App {
     }
 }
 
+/// Inline diff of a proposal in an answer, or why it cannot be shown.
+type DiffPreview = Result<Vec<codebot_core::ChangePreview>, String>;
+
 /// Saved chats being read in the background, and when reading began.
 type StartupLoad = (
     mpsc::Receiver<Result<Option<chat_storage::Archive>, String>>,
@@ -2547,7 +2542,7 @@ fn focus_ring(ui: &egui::Ui, response: &egui::Response, radius: f32) {
         ui.painter().rect_stroke(
             response.rect.expand(2.0),
             radius + 2.0,
-            egui::Stroke::new(2.0_f32, ACCENT),
+            egui::Stroke::new(2.0_f32, ACCENT()),
             egui::StrokeKind::Outside,
         );
     }
@@ -2594,23 +2589,30 @@ fn apply_skills(
 }
 
 /// Material input chip with a colored dot and a remove action.
-fn chip(ui: &mut egui::Ui, kind: &str, name: &str, color: Color32) -> egui::Response {
+/// Material input chip with a colored dot; `removable` adds the drawn close mark.
+fn chip(
+    ui: &mut egui::Ui,
+    kind: &str,
+    name: &str,
+    color: Color32,
+    removable: bool,
+) -> egui::Response {
     let mut label = egui::text::LayoutJob::default();
     label.append(
         &format!("{kind}: {name}"),
         14.0,
-        egui::TextFormat::simple(egui::FontId::proportional(13.0), ON_SECONDARY_CONTAINER),
+        egui::TextFormat::simple(egui::FontId::proportional(13.0), ON_SECONDARY_CONTAINER()),
     );
     // Room for the drawn close mark (the UI fonts have no ✕ glyph).
     label.append(
         " ",
-        18.0,
-        egui::TextFormat::simple(egui::FontId::proportional(13.0), MUTED),
+        if removable { 18.0 } else { 4.0 },
+        egui::TextFormat::simple(egui::FontId::proportional(13.0), MUTED()),
     );
     let response = ui.add(
         egui::Button::new(label)
-            .fill(SURFACE)
-            .stroke(egui::Stroke::new(1.0_f32, BORDER))
+            .fill(SURFACE())
+            .stroke(egui::Stroke::new(1.0_f32, BORDER()))
             .corner_radius(8.0)
             .min_size(egui::vec2(0.0, 30.0)),
     );
@@ -2620,14 +2622,19 @@ fn chip(ui: &mut egui::Ui, kind: &str, name: &str, color: Color32) -> egui::Resp
         color,
     );
     let mark = egui::pos2(response.rect.right() - 16.0, response.rect.center().y);
-    let stroke = egui::Stroke::new(1.5_f32, MUTED);
-    for (a, b) in [((-3.5, -3.5), (3.5, 3.5)), ((-3.5, 3.5), (3.5, -3.5))] {
+    let stroke = egui::Stroke::new(1.5_f32, MUTED());
+    let marks: &[((f32, f32), (f32, f32))] = if removable {
+        &[((-3.5, -3.5), (3.5, 3.5)), ((-3.5, 3.5), (3.5, -3.5))]
+    } else {
+        &[]
+    };
+    for &(a, b) in marks {
         ui.painter().line_segment(
             [mark + egui::vec2(a.0, a.1), mark + egui::vec2(b.0, b.1)],
             stroke,
         );
     }
-    state_layer(ui, &response, 8.0, TEXT);
+    state_layer(ui, &response, 8.0, TEXT());
     response.widget_info(|| {
         egui::WidgetInfo::labeled(
             egui::WidgetType::Button,
@@ -2641,7 +2648,7 @@ fn chip(ui: &mut egui::Ui, kind: &str, name: &str, color: Color32) -> egui::Resp
 /// Material search bar: a full-radius container with a leading search icon.
 fn search_bar(ui: &mut egui::Ui, query: &mut String) -> egui::Response {
     egui::Frame::new()
-        .fill(SURFACE)
+        .fill(SURFACE())
         .corner_radius(SHAPE_FULL)
         .inner_margin(egui::Margin {
             left: 44,
@@ -2652,13 +2659,13 @@ fn search_bar(ui: &mut egui::Ui, query: &mut String) -> egui::Response {
         .show(ui, |ui| {
             let response = ui.add(
                 crate::text_field(query)
-                    .hint_text(RichText::new("チャットを検索").color(MUTED))
+                    .hint_text(RichText::new("チャットを検索").color(MUTED()))
                     .frame(false)
                     .margin(egui::Vec2::ZERO)
                     .desired_width(f32::INFINITY),
             );
             let c = egui::pos2(response.rect.left() - 23.0, response.rect.center().y - 1.0);
-            let stroke = egui::Stroke::new(1.75_f32, MUTED);
+            let stroke = egui::Stroke::new(1.75_f32, MUTED());
             ui.painter().circle_stroke(c, 5.0, stroke);
             ui.painter()
                 .line_segment([c + egui::vec2(3.8, 3.8), c + egui::vec2(7.5, 7.5)], stroke);
@@ -2671,9 +2678,9 @@ fn search_bar(ui: &mut egui::Ui, query: &mut String) -> egui::Response {
 fn drawer_item(ui: &mut egui::Ui, text: &str, selected: bool) -> egui::Response {
     let response = ui.add(
         egui::Button::new(RichText::new(text).size(14.0).color(if selected {
-            ON_SECONDARY_CONTAINER
+            ON_SECONDARY_CONTAINER()
         } else {
-            MUTED
+            MUTED()
         }))
         .truncate()
         .min_size(egui::vec2(ui.available_width(), 44.0))
@@ -2681,13 +2688,13 @@ fn drawer_item(ui: &mut egui::Ui, text: &str, selected: bool) -> egui::Response 
         .corner_radius(SHAPE_FULL)
         .stroke(egui::Stroke::NONE)
         .fill(if selected {
-            SELECTED
+            SELECTED()
         } else {
             Color32::TRANSPARENT
         }),
     );
     let radius = response.rect.height() / 2.0;
-    state_layer(ui, &response, radius, TEXT);
+    state_layer(ui, &response, radius, TEXT());
     focus_ring(ui, &response, radius);
     response
 }
@@ -2703,23 +2710,28 @@ fn tab_button(ui: &mut egui::Ui, text: &str, selected: bool) -> egui::Response {
     let previous = std::mem::replace(&mut ui.spacing_mut().button_padding.x, padding);
     let response = ui.add(
         egui::Button::new(RichText::new(text).size(14.0).color(if selected {
-            ON_SECONDARY_CONTAINER
+            ON_SECONDARY_CONTAINER()
         } else {
-            ACCENT
+            ACCENT()
         }))
         .selected(selected)
         .min_size(egui::vec2(0.0, 36.0))
         .corner_radius(SHAPE_FULL)
         .stroke(egui::Stroke::NONE)
         .fill(if selected {
-            SELECTED
+            SELECTED()
         } else {
             Color32::TRANSPARENT
         }),
     );
     ui.spacing_mut().button_padding.x = previous;
     let radius = response.rect.height() / 2.0;
-    state_layer(ui, &response, radius, if selected { TEXT } else { ACCENT });
+    state_layer(
+        ui,
+        &response,
+        radius,
+        if selected { TEXT() } else { ACCENT() },
+    );
     focus_ring(ui, &response, radius);
     response
 }
@@ -2729,7 +2741,7 @@ fn new_chat_button(ui: &mut egui::Ui) -> egui::Response {
     let mut label = egui::text::LayoutJob::simple_singleline(
         "新しいチャット".into(),
         egui::FontId::proportional(14.0),
-        ON_PRIMARY_CONTAINER,
+        ON_PRIMARY_CONTAINER(),
     );
     // Reserve room for the drawn icon while retaining the native button label.
     label.sections[0].leading_space = 28.0;
@@ -2741,7 +2753,7 @@ fn new_chat_button(ui: &mut egui::Ui) -> egui::Response {
             .shortcut_text("")
             .corner_radius(SHAPE_LARGE)
             .stroke(egui::Stroke::NONE)
-            .fill(PRIMARY_CONTAINER),
+            .fill(PRIMARY_CONTAINER()),
     );
     let level = if response.hovered() { 2.0 } else { 1.0 };
     ui.painter().set(
@@ -2754,10 +2766,10 @@ fn new_chat_button(ui: &mut egui::Ui) -> egui::Response {
         }
         .as_shape(response.rect, SHAPE_LARGE),
     );
-    state_layer(ui, &response, SHAPE_LARGE, ON_PRIMARY_CONTAINER);
+    state_layer(ui, &response, SHAPE_LARGE, ON_PRIMARY_CONTAINER());
     focus_ring(ui, &response, SHAPE_LARGE);
     let center = egui::pos2(response.rect.left() + 26.0, response.rect.center().y);
-    let stroke = egui::Stroke::new(2.0_f32, ON_PRIMARY_CONTAINER);
+    let stroke = egui::Stroke::new(2.0_f32, ON_PRIMARY_CONTAINER());
     for offset in [egui::vec2(6.0, 0.0), egui::vec2(0.0, 6.0)] {
         ui.painter()
             .line_segment([center - offset, center + offset], stroke);
@@ -2781,9 +2793,9 @@ fn icon_button(
             .stroke(egui::Stroke::NONE)
             .fill(if primary {
                 if enabled {
-                    ACCENT
+                    ACCENT()
                 } else {
-                    DISABLED
+                    DISABLED()
                 }
             } else {
                 Color32::TRANSPARENT
@@ -2794,16 +2806,16 @@ fn icon_button(
     let radius = response.rect.height() / 2.0;
     if primary && enabled && (response.hovered() || response.is_pointer_button_down_on()) {
         ui.painter()
-            .circle_filled(response.rect.center(), radius, ACCENT_HOVER);
+            .circle_filled(response.rect.center(), radius, ACCENT_HOVER());
     } else if !primary {
-        state_layer(ui, &response, radius, MUTED);
+        state_layer(ui, &response, radius, MUTED());
     }
     let color = if primary && enabled {
-        Color32::WHITE
+        ON_PRIMARY()
     } else if enabled {
-        MUTED
+        MUTED()
     } else {
-        DISABLED_CONTENT
+        DISABLED_CONTENT()
     };
     let p = ui.painter();
     let c = response.rect.center();
@@ -2853,7 +2865,7 @@ fn icon_button(
         Icon::Settings => {
             for (x, y) in [(-5.0, -3.0), (0.0, 4.0), (5.0, -1.0)] {
                 line([x, -7.0], [x, 7.0]);
-                p.circle_filled(c + egui::vec2(x, y), 2.7, SURFACE);
+                p.circle_filled(c + egui::vec2(x, y), 2.7, SURFACE());
                 p.circle_stroke(c + egui::vec2(x, y), 2.2, stroke);
             }
         }
@@ -2878,82 +2890,7 @@ fn main() -> eframe::Result {
         },
         Box::new(|cc| {
             let app = App::load(&cc.egui_ctx);
-            cc.egui_ctx.set_theme(egui::Theme::Light);
-            let mut style = (*cc.egui_ctx.style()).clone();
-            style.visuals = egui::Visuals::light();
-            // Per-role text colors instead of an override, so hints and disabled
-            // text keep their weaker emphasis.
-            style.visuals.override_text_color = None;
-            style.visuals.panel_fill = SHELL;
-            style.visuals.extreme_bg_color = RAISED;
-            style.visuals.faint_bg_color = SHELL;
-            style.visuals.code_bg_color = SHELL;
-            style.visuals.window_fill = SURFACE;
-            style.visuals.window_stroke = egui::Stroke::NONE;
-            style.visuals.error_fg_color = ERROR;
-            style.visuals.hyperlink_color = ACCENT;
-            style.visuals.selection.bg_fill = SELECTED;
-            // Also the focused text-field indicator and selected-label text.
-            style.visuals.selection.stroke = egui::Stroke::new(2.0_f32, ACCENT);
-            // Menus and popups: elevation level 2, medium shape.
-            style.visuals.menu_corner_radius = egui::CornerRadius::same(12);
-            style.visuals.window_corner_radius = egui::CornerRadius::same(28);
-            let elevation = egui::Shadow {
-                offset: [0, 2],
-                blur: 8,
-                spread: 0,
-                color: Color32::from_black_alpha(40),
-            };
-            style.visuals.popup_shadow = elevation;
-            style.visuals.window_shadow = elevation;
-            // Dividers use outline-variant.
-            style.visuals.widgets.noninteractive.bg_stroke = egui::Stroke::new(1.0_f32, BORDER);
-            style.visuals.widgets.noninteractive.fg_stroke.color = TEXT;
-            // Filled tonal buttons (secondary container) with 8%/12% state layers.
-            style.visuals.widgets.inactive.weak_bg_fill = SELECTED;
-            style.visuals.widgets.inactive.bg_fill = RAISED;
-            style.visuals.widgets.hovered.weak_bg_fill = Color32::from_rgb(199, 211, 231);
-            style.visuals.widgets.hovered.bg_fill = Color32::from_rgb(220, 222, 229);
-            style.visuals.widgets.active.weak_bg_fill = Color32::from_rgb(191, 203, 223);
-            style.visuals.widgets.active.bg_fill = Color32::from_rgb(214, 217, 224);
-            style.visuals.widgets.open.weak_bg_fill = Color32::from_rgb(191, 203, 223);
-            for widget in [
-                &mut style.visuals.widgets.inactive,
-                &mut style.visuals.widgets.hovered,
-                &mut style.visuals.widgets.active,
-                &mut style.visuals.widgets.open,
-            ] {
-                // 18 = half the 36px control height: pill buttons and single-line
-                // fields, while multi-line fields keep moderately rounded corners.
-                widget.corner_radius = egui::CornerRadius::same(18);
-                widget.bg_stroke = egui::Stroke::NONE;
-                widget.fg_stroke.color = ON_SECONDARY_CONTAINER;
-                widget.expansion = 0.0;
-            }
-            style.spacing.button_padding = egui::vec2(16.0, 8.0);
-            style.spacing.item_spacing = egui::vec2(8.0, 8.0);
-            style.spacing.interact_size.y = 36.0;
-            style.spacing.icon_width = 18.0;
-            style.spacing.icon_width_inner = 8.0;
-            style.spacing.icon_spacing = 10.0;
-            style.spacing.menu_margin = egui::Margin::same(8);
-            // Material type scale: headline small, body, label large, label medium.
-            style
-                .text_styles
-                .insert(egui::TextStyle::Heading, egui::FontId::proportional(22.0));
-            style
-                .text_styles
-                .insert(egui::TextStyle::Body, egui::FontId::proportional(15.0));
-            style
-                .text_styles
-                .insert(egui::TextStyle::Button, egui::FontId::proportional(14.0));
-            style
-                .text_styles
-                .insert(egui::TextStyle::Small, egui::FontId::proportional(12.0));
-            style
-                .text_styles
-                .insert(egui::TextStyle::Monospace, egui::FontId::monospace(14.0));
-            cc.egui_ctx.set_style(style);
+            theme::apply(&cc.egui_ctx, theme::wants_dark(&cc.egui_ctx, app.theme));
             Ok(Box::new(app))
         }),
     )

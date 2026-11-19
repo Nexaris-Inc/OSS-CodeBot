@@ -2,12 +2,7 @@
 //! measured in characters against the configured `max_context_chars` budget.
 use eframe::egui::{self, Color32, RichText};
 
-/// Segment colors: Material tonal accents that stay distinguishable on white.
-pub const SKILLS: Color32 = Color32::from_rgb(125, 82, 96);
-pub const TOOLS: Color32 = Color32::from_rgb(91, 95, 151);
-pub const HISTORY: Color32 = Color32::from_rgb(0, 95, 184);
-pub const ATTACHMENTS: Color32 = Color32::from_rgb(46, 125, 91);
-pub const INPUT: Color32 = Color32::from_rgb(178, 106, 0);
+pub use crate::theme::{ATTACHMENTS, HISTORY, INPUT, SKILLS, TOOLS};
 
 pub struct Segment {
     pub label: &'static str,
@@ -59,7 +54,7 @@ fn paint_bar(
     let (rect, response) = ui.allocate_exact_size(size, egui::Sense::hover());
     let painter = ui.painter();
     let radius = size.y / 2.0;
-    painter.rect_filled(rect, radius, crate::RAISED);
+    painter.rect_filled(rect, radius, crate::RAISED());
     let budget = budget.max(1) as f32;
     let mut x = rect.left();
     let clip = painter.with_clip_rect(rect);
@@ -98,7 +93,7 @@ pub fn detail(ui: &mut egui::Ui, title: &str, segments: &[Segment], budget: usiz
                     percent(total, budget)
                 ))
                 .size(12.0)
-                .color(crate::MUTED),
+                .color(crate::MUTED()),
             );
         });
     });
@@ -114,7 +109,7 @@ pub fn detail(ui: &mut egui::Ui, title: &str, segments: &[Segment], budget: usiz
                     let (dot, _) =
                         ui.allocate_exact_size(egui::vec2(10.0, 10.0), egui::Sense::hover());
                     let color = if segment.note.is_some() {
-                        crate::DISABLED_CONTENT
+                        crate::DISABLED_CONTENT()
                     } else {
                         segment.color
                     };
@@ -124,7 +119,7 @@ pub fn detail(ui: &mut egui::Ui, title: &str, segments: &[Segment], budget: usiz
                 ui.label(
                     RichText::new(format!("{}文字", short(segment.chars)))
                         .size(13.0)
-                        .color(crate::MUTED),
+                        .color(crate::MUTED()),
                 );
                 ui.label(
                     RichText::new(match &segment.note {
@@ -135,7 +130,7 @@ pub fn detail(ui: &mut egui::Ui, title: &str, segments: &[Segment], budget: usiz
                         ),
                     })
                     .size(12.0)
-                    .color(crate::MUTED),
+                    .color(crate::MUTED()),
                 );
                 ui.end_row();
             }
@@ -144,14 +139,14 @@ pub fn detail(ui: &mut egui::Ui, title: &str, segments: &[Segment], budget: usiz
                 ui.painter().circle_stroke(
                     dot.center(),
                     4.5,
-                    egui::Stroke::new(1.0_f32, crate::OUTLINE),
+                    egui::Stroke::new(1.0_f32, crate::OUTLINE()),
                 );
                 ui.label(RichText::new("空き").size(13.0));
             });
             ui.label(
                 RichText::new(format!("{}文字", short(budget.saturating_sub(total))))
                     .size(13.0)
-                    .color(crate::MUTED),
+                    .color(crate::MUTED()),
             );
             ui.label("");
             ui.end_row();
@@ -159,7 +154,7 @@ pub fn detail(ui: &mut egui::Ui, title: &str, segments: &[Segment], budget: usiz
     ui.label(
         RichText::new("文字数はアプリの送信上限（設定ファイルのmax_context_chars）に対する目安です。モデルのトークン数とは一致しません。")
             .size(11.0)
-            .color(crate::MUTED),
+            .color(crate::MUTED()),
     );
 }
 
@@ -180,7 +175,7 @@ pub fn compact(ui: &mut egui::Ui, segments: &[Segment], budget: usize) -> egui::
             ui.label(
                 RichText::new(percent(total, budget))
                     .size(11.0)
-                    .color(if over { crate::ERROR } else { crate::MUTED }),
+                    .color(if over { crate::ERROR() } else { crate::MUTED() }),
             );
             paint_bar(ui, segments, budget, egui::vec2(72.0, 6.0));
         })

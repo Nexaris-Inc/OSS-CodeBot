@@ -55,6 +55,13 @@ These tokens live in `crates/codebot-gui/src/main.rs`. The UI has no decorative 
 - Below 900px, replace the sidebar with a session menu. Support the minimum 700×540 viewport without shrinking text.
 - Below the composer, name the active API destination or state that local processing sends nothing externally. Never show a non-networked claim for API mode. Do not repeat it across header and sidebar.
 
+## Chat tools, search and suggestions
+
+- With an API destination, the composer row offers ツールを使う per chat. Sending then runs the tool engine inline below the messages in an outlined card (title, end action, replies, the existing command/change/connector review UI, result confirmation). The final answer is added as a normal assistant message.
+- Above the composer, files mentioned in the draft appear as chips (green dot, no close mark) that open the Files page around that line. Attached skills and connectors use chips with a close mark.
+- At 80% of the context budget, a one-line notice appears below the composer, with 古い履歴を外す when history is included.
+- Answers with a change proposal show a collapsible inline diff (diff colors from the theme).
+
 ## Startup loading state
 
 - Saved chats are read on a background thread at startup. Until they are applied, saving, sending and the chat UI stay blocked, so the archive is never overwritten by the empty startup session.
@@ -78,7 +85,7 @@ Linux virtual-display captures cover 1180×800 and 700×540, empty and populated
 
 Use LINE Seed JP Regular 400 for all UI text by default, including emphasis labels. Settings lets the user choose BIZ UDPGothic (Regular body, actual Bold section labels). Do not simulate weights. Apply the choice immediately and persist it in `gui-preferences.toml` beside the OS-standard application config file; this file is independent of the diagnostic TOML path. Report read/write errors in Settings. Keep Noto assets as historical material, not active UI fonts. Each active font has a bundled OFL license under `assets/fonts/`.
 
-The default theme is explicitly Light, independent of the OS preference. Use a circular primary background with a white arrow for enabled send; disabled send uses the on-surface 12% container with a 38% arrow. Keep dark text on the light chat surface, and blue focus indicators.
+The default theme is explicitly Light, independent of the OS preference. Settings → 表示 offers ライト（標準）, ダーク and OSに合わせる (follows the OS while running); the choice is stored in `gui-preferences.toml`. Both schemes are Material 3 roles in `crates/codebot-gui/src/theme.rs`, read through accessors such as `ACCENT()`. Dark values: shell #1D2024, pane #111418, raised #282A2F, outline-variant #43474E, on-surface #E1E2E9, on-surface-variant #C3C6CF, primary #A4C9FF with on-primary #00315D, primary-container #004786 / #D4E3FF, secondary-container #3B4858 / #D7E3F8, error #FFB4AB. Text keeps at least 7:1 (secondary text 4.5:1) on the pane and drawer in both schemes; a test checks this. Code blocks use InspiredGitHub (light) and base16-ocean.dark (dark). Use a circular primary background with a white arrow for enabled send; disabled send uses the on-surface 12% container with a 38% arrow. Keep dark text on the light chat surface, and blue focus indicators.
 
 Application checkboxes and radio buttons display a 2px outline ring when unselected, and a primary ring with a filled primary center dot when selected, with a circular state layer on hover/focus. Draw the indicator with vector circles so it stays consistent across fonts and display scales. Use the shared `checkbox::Checkbox` and `checkbox::Radio` widgets for selection and confirmation controls, preserving egui's label click, keyboard, focus, disabled state, and accessibility semantics. Use `text_field`/`text_area` for text inputs so they share Material padding.
 

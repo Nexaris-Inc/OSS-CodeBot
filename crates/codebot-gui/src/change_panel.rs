@@ -388,15 +388,15 @@ pub(crate) fn diff_job(text: &str) -> egui::text::LayoutJob {
     let mut job = egui::text::LayoutJob::default();
     for line in text.split_inclusive('\n') {
         let color = if line.starts_with("--- ") || line.starts_with("+++ ") {
-            crate::MUTED
+            crate::MUTED()
         } else if line.starts_with('+') {
-            egui::Color32::from_rgb(22, 113, 61)
+            crate::DIFF_ADD()
         } else if line.starts_with('-') {
-            egui::Color32::from_rgb(180, 35, 24)
+            crate::DIFF_DEL()
         } else if line.starts_with("@@") {
-            crate::ACCENT
+            crate::ACCENT()
         } else {
-            crate::TEXT
+            crate::TEXT()
         };
         job.append(
             line,

@@ -27,6 +27,7 @@ pub struct UiPreferences {
     pub github: GithubConfig,
     pub connectors: Vec<codebot_core::ConnectorConfig>,
     pub reduce_motion: bool,
+    pub theme: crate::theme::ThemeChoice,
 }
 
 impl UiPreferences {

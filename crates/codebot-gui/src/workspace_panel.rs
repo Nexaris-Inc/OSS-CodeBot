@@ -63,7 +63,7 @@ impl WorkspacePanel {
                     crate::text_field(&mut self.query)
                         .hint_text(
                             egui::RichText::new("ファイル名で絞り込み・本文を検索")
-                                .color(crate::MUTED),
+                                .color(crate::MUTED()),
                         )
                         .desired_width(ui.available_width()),
                 );
@@ -99,7 +99,7 @@ impl WorkspacePanel {
                     }
                 ))
                 .size(13.0)
-                .color(crate::MUTED),
+                .color(crate::MUTED()),
             );
             let mut open = None;
             egui::ScrollArea::vertical()

@@ -108,18 +108,22 @@ fn paint_indicator(ui: &Ui, response: &Response, checked: bool) {
         0.0
     };
     if layer > 0.0 {
-        let tint = if checked { crate::ACCENT } else { crate::TEXT };
+        let tint = if checked {
+            crate::ACCENT()
+        } else {
+            crate::TEXT()
+        };
         painter.circle_filled(center, radius + 7.0, tint.gamma_multiply(layer));
     }
     if response.has_focus() {
-        painter.circle_stroke(center, radius + 7.0, Stroke::new(2.0_f32, crate::ACCENT));
+        painter.circle_stroke(center, radius + 7.0, Stroke::new(2.0_f32, crate::ACCENT()));
     }
     let color = if !response.enabled() {
-        crate::DISABLED_CONTENT
+        crate::DISABLED_CONTENT()
     } else if checked {
-        crate::ACCENT
+        crate::ACCENT()
     } else {
-        crate::OUTLINE
+        crate::OUTLINE()
     };
     painter.circle_stroke(center, radius - 1.0, Stroke::new(2.0_f32, color));
     if checked {

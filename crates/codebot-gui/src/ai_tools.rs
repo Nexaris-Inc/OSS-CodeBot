@@ -635,7 +635,7 @@ impl ToolPanel {
     /// Inline view under the chat messages.
     pub fn chat_ui(&mut self, ui: &mut egui::Ui, can_mutate: bool) {
         egui::Frame::new()
-            .stroke(egui::Stroke::new(1.0_f32, crate::BORDER))
+            .stroke(egui::Stroke::new(1.0_f32, crate::BORDER()))
             .corner_radius(12.0)
             .inner_margin(egui::Margin::symmetric(16, 12))
             .show(ui, |ui| {
@@ -655,7 +655,7 @@ impl ToolPanel {
                 ui.label(
                     RichText::new("操作ごとに内容を確認し、結果をAIへ送る前にも確認します。最大4操作・8回の通信です。")
                         .size(12.0)
-                        .color(crate::MUTED),
+                        .color(crate::MUTED()),
                 );
                 self.progress_ui(ui, can_mutate);
                 if let Some(message) = self.message.as_ref().filter(|m| m.as_str() != DONE) {
@@ -679,7 +679,7 @@ impl ToolPanel {
                 egui::Label::new(
                     RichText::new(&tool.description)
                         .size(13.0)
-                        .color(crate::MUTED),
+                        .color(crate::MUTED()),
                 )
                 .wrap(),
             );
@@ -711,7 +711,7 @@ impl ToolPanel {
                     config.timeout_seconds
                 ))
                 .size(12.0)
-                .color(crate::MUTED),
+                .color(crate::MUTED()),
             )
             .wrap(),
         );
@@ -775,11 +775,11 @@ impl ToolPanel {
                 &conversation.connector_tools(),
             );
             vec![
-                Segment::new("ツール定義", tools, context_bar::TOOLS),
+                Segment::new("ツール定義", tools, context_bar::TOOLS()),
                 Segment::new(
                     "相談の内容・回答・結果",
                     conversation.request_chars().saturating_sub(tools),
-                    context_bar::HISTORY,
+                    context_bar::HISTORY(),
                 ),
             ]
         } else {
@@ -789,20 +789,24 @@ impl ToolPanel {
             let tools = Segment::new(
                 "ツール定義",
                 codebot_core::tool_definitions_chars(protocol, &[]),
-                context_bar::TOOLS,
+                context_bar::TOOLS(),
             );
             vec![
                 Segment::new(
                     "スキル",
                     codebot_core::skill_preamble(&skills).chars().count(),
-                    context_bar::SKILLS,
+                    context_bar::SKILLS(),
                 ),
                 tools,
-                Segment::new("相談内容", self.prompt.chars().count(), context_bar::INPUT),
+                Segment::new(
+                    "相談内容",
+                    self.prompt.chars().count(),
+                    context_bar::INPUT(),
+                ),
             ]
         };
         egui::Frame::new()
-            .stroke(egui::Stroke::new(1.0_f32, crate::BORDER))
+            .stroke(egui::Stroke::new(1.0_f32, crate::BORDER()))
             .corner_radius(12.0)
             .inner_margin(egui::Margin::symmetric(16, 12))
             .show(ui, |ui| {
@@ -813,7 +817,7 @@ impl ToolPanel {
                             "コネクターのツール定義は、接続して一覧を取得した後に加わります。",
                         )
                         .size(11.0)
-                        .color(crate::MUTED),
+                        .color(crate::MUTED()),
                     );
                 }
             });

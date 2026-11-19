@@ -466,11 +466,11 @@ pub(crate) fn diff(ui: &mut egui::Ui, id: &str, text: &str) {
                         .map(|(i, _)| i)
                         .unwrap_or(line.len());
                     let color = if line.starts_with('+') && !line.starts_with("+++") {
-                        egui::Color32::from_rgb(0, 110, 45)
+                        crate::DIFF_ADD()
                     } else if line.starts_with('-') && !line.starts_with("---") {
-                        egui::Color32::from_rgb(175, 30, 30)
+                        crate::DIFF_DEL()
                     } else if line.starts_with("@@") {
-                        egui::Color32::from_rgb(0, 95, 184)
+                        crate::ACCENT()
                     } else {
                         ui.visuals().text_color()
                     };
