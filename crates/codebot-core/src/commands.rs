@@ -72,7 +72,7 @@ impl PreparedCommand {
         &self.preview
     }
 }
-const BASE_ENV: &[&str] = &[
+pub(crate) const BASE_ENV: &[&str] = &[
     "PATH",
     "HOME",
     "USERPROFILE",
@@ -108,7 +108,7 @@ const BASE_ENV: &[&str] = &[
     "UniversalCRTSdkDir",
     "UCRTVersion",
 ];
-fn valid_name(name: &str) -> bool {
+pub(crate) fn valid_name(name: &str) -> bool {
     !name.is_empty()
         && name.len() <= 128
         && name
@@ -116,7 +116,7 @@ fn valid_name(name: &str) -> bool {
             .enumerate()
             .all(|(i, b)| b == b'_' || b.is_ascii_alphabetic() || i > 0 && b.is_ascii_digit())
 }
-fn sensitive(name: &str) -> bool {
+pub(crate) fn sensitive(name: &str) -> bool {
     let name = name.to_ascii_uppercase();
     [
         "TOKEN",

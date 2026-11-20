@@ -234,6 +234,113 @@ impl Workspace {
     }
 }
 
+/// One matching line from [`Workspace::search`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SearchHit {
+    pub path: String,
+    pub line: usize,
+    pub text: String,
+}
+/// A workspace file mentioned in free text, e.g. `src/main.rs:12`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PathMention {
+    pub path: String,
+    pub line: Option<usize>,
+}
+impl Workspace {
+    /// Search file names and contents (case-insensitive). Uses the same
+    /// exclusions and 64 KiB UTF-8 limit as attachments; other files are skipped.
+    pub fn search(&self, query: &str, max_hits: usize) -> Result<Vec<SearchHit>, String> {
+        let query = query.trim().to_lowercase();
+        if query.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut hits = Vec::new();
+        for path in self.files()? {
+            if hits.len() >= max_hits {
+                break;
+            }
+            if path.to_lowercase().contains(&query) {
+                hits.push(SearchHit {
+                    path: path.clone(),
+                    line: 1,
+                    text: String::new(),
+                });
+            }
+            let Ok(file) = self.dir.open(&path) else {
+                continue;
+            };
+            if file
+                .metadata()
+                .map_or(true, |m| !m.is_file() || m.len() > MAX_FILE_BYTES as u64)
+            {
+                continue;
+            }
+            let mut bytes = Vec::new();
+            if file
+                .take((MAX_FILE_BYTES + 1) as u64)
+                .read_to_end(&mut bytes)
+                .is_err()
+                || bytes.len() > MAX_FILE_BYTES
+                || bytes.contains(&0)
+            {
+                continue;
+            }
+            let Ok(text) = String::from_utf8(bytes) else {
+                continue;
+            };
+            for (index, line) in text.lines().enumerate() {
+                if hits.len() >= max_hits {
+                    break;
+                }
+                if line.to_lowercase().contains(&query) {
+                    hits.push(SearchHit {
+                        path: path.clone(),
+                        line: index + 1,
+                        text: line.trim().chars().take(160).collect(),
+                    });
+                }
+            }
+        }
+        Ok(hits)
+    }
+    /// Workspace files mentioned in `text` (paths relative to the workspace,
+    /// optionally followed by `:line`), in order of appearance, without duplicates.
+    pub fn mentions(&self, text: &str, max: usize) -> Result<Vec<PathMention>, String> {
+        let files = self.files()?;
+        let root = self.root.to_string_lossy().replace('\\', "/");
+        let mut found: Vec<PathMention> = Vec::new();
+        for token in text.split(|c: char| c.is_whitespace() || "\"'`()[]{}<>,;".contains(c)) {
+            if found.len() >= max {
+                break;
+            }
+            let token = token.replace('\\', "/");
+            let token = token.trim_end_matches(['.', ':']);
+            let token = token.strip_prefix(&format!("{root}/")).unwrap_or(token);
+            let token = token.strip_prefix("./").unwrap_or(token);
+            // path[:line[:column]]
+            let mut parts = token.splitn(3, ':');
+            let path = parts.next().unwrap_or("");
+            let line = parts
+                .next()
+                .and_then(|l| l.parse::<usize>().ok())
+                .filter(|l| *l > 0);
+            if path.is_empty() || !files.iter().any(|f| f.replace('\\', "/") == path) {
+                continue;
+            }
+            let path = files
+                .iter()
+                .find(|f| f.replace('\\', "/") == path)
+                .unwrap()
+                .clone();
+            if !found.iter().any(|m| m.path == path && m.line == line) {
+                found.push(PathMention { path, line });
+            }
+        }
+        Ok(found)
+    }
+}
+
 pub fn compose_input(input: &str, attachments: &[Attachment]) -> Result<String, String> {
     if attachments.len() > 8 {
         return Err("添付は8ファイルまでです".into());
@@ -259,6 +366,46 @@ pub fn compose_input(input: &str, attachments: &[Attachment]) -> Result<String, 
 mod tests {
     use super::*;
     use std::fs::File;
+    #[test]
+    fn search_and_mentions_respect_exclusions() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("src")).unwrap();
+        std::fs::write(
+            dir.path().join("src/main.rs"),
+            "fn main() {\n    let Config = 1;\n}\n",
+        )
+        .unwrap();
+        std::fs::write(dir.path().join(".env"), "CONFIG_SECRET=1\n").unwrap();
+        std::fs::write(dir.path().join("blob.bin"), [0u8, 1, 2, b'c', b'o', b'n']).unwrap();
+        let workspace = Workspace::open(dir.path()).unwrap();
+        let hits = workspace.search("config", 10).unwrap();
+        assert_eq!(
+            hits,
+            vec![SearchHit {
+                path: "src/main.rs".into(),
+                line: 2,
+                text: "let Config = 1;".into()
+            }]
+        );
+        assert_eq!(workspace.search("main", 10).unwrap()[0].line, 1);
+        assert_eq!(workspace.search("  ", 10).unwrap(), vec![]);
+
+        let text = format!("error at src/main.rs:2:5, see ./src/main.rs and {}/src/main.rs. Also missing.rs:3 and .env", workspace.root().display());
+        let mentions = workspace.mentions(&text, 8).unwrap();
+        assert_eq!(
+            mentions,
+            vec![
+                PathMention {
+                    path: "src/main.rs".into(),
+                    line: Some(2)
+                },
+                PathMention {
+                    path: "src/main.rs".into(),
+                    line: None
+                },
+            ]
+        );
+    }
     #[test]
     fn citation_paths_are_relative_decoded_and_confined() {
         assert_eq!(

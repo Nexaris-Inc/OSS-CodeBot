@@ -16,9 +16,13 @@ mod api_diagnostics;
 mod change_panel;
 mod chat_storage;
 mod checkbox;
+mod theme;
+pub(crate) use theme::*;
 mod command_panel;
+mod context_bar;
 mod git_panel;
 mod github_panel;
+mod library;
 mod local_diagnostics;
 mod local_models;
 mod markdown;
@@ -30,16 +34,15 @@ mod workspace_panel;
 use local_models::LocalModels;
 use ui_preferences::{apply_font, FontChoice, UiPreferences};
 
-const SHELL: Color32 = Color32::from_rgb(244, 247, 251);
-const SURFACE: Color32 = Color32::WHITE;
-const RAISED: Color32 = Color32::from_rgb(248, 250, 253);
-const BORDER: Color32 = Color32::from_rgb(210, 220, 233);
-const TEXT: Color32 = Color32::from_rgb(28, 40, 58);
-const MUTED: Color32 = Color32::from_rgb(88, 104, 125);
-const ACCENT: Color32 = Color32::from_rgb(0, 95, 184);
-const ACCENT_HOVER: Color32 = Color32::from_rgb(0, 78, 153);
-const SELECTED: Color32 = Color32::from_rgb(229, 240, 253);
-const DISABLED: Color32 = Color32::from_rgb(219, 227, 238);
+// Material Design 3 color roles (light scheme generated around the #005FB8 brand primary).
+/// Shape scale: full (pill) buttons, large panes, extra-large composer.
+const SHAPE_FULL: u8 = 255;
+const SHAPE_LARGE: f32 = 16.0;
+const SHAPE_EXTRA_LARGE: f32 = 28.0;
+/// Loading indicators appear only when startup work takes longer than this.
+const LOADING_DELAY: std::time::Duration = std::time::Duration::from_millis(300);
+/// Cross-fade from the loading state to the restored content.
+const REVEAL_MS: f32 = 140.0;
 const MEASURE: f32 = 680.0;
 const COMPOSER_WIDTH: f32 = 740.0;
 
@@ -65,6 +68,12 @@ struct Session {
     #[serde(skip)]
     stream_index: Option<usize>,
     generation_incomplete: bool,
+    /// Skill names attached to this chat.
+    skills: Vec<String>,
+    /// Connector names attached to this chat.
+    connectors: Vec<String>,
+    /// Let the model propose changes, commands and connector calls in this chat.
+    use_tools: bool,
 }
 impl Session {
     fn request_messages(
@@ -167,6 +176,24 @@ struct App {
     github_open: bool,
     tools_open: bool,
     plugins_open: bool,
+    library_open: bool,
+    library_panel: library::LibraryPanel,
+    connectors: Vec<codebot_core::ConnectorConfig>,
+    /// (config path, max_context_chars, max_input_chars) for the context meter.
+    budget_cache: Option<(String, usize, usize)>,
+    /// Workspace files mentioned in the active draft: (root + draft key, mentions).
+    mention_cache: Option<(String, Vec<codebot_core::PathMention>)>,
+    /// Inline diff previews of proposals in answers, by (session, message).
+    diff_cache: BTreeMap<(usize, usize), DiffPreview>,
+    /// A tool conversation started from a chat: (session index, engine).
+    chat_tool: Option<(usize, Box<ai_tools::ToolPanel>)>,
+    /// Saved chats being read at startup, and when reading began.
+    startup_load: Option<StartupLoad>,
+    /// Start of the cross-fade after a visible loading state.
+    reveal: Option<std::time::Instant>,
+    /// Stop the skeleton pulse, progress bar motion and cross-fade.
+    reduce_motion: bool,
+    theme: theme::ThemeChoice,
     plugin_panel: plugins::PluginPanel,
     tool_panel: ai_tools::ToolPanel,
     github_panel: github_panel::GithubPanel,
@@ -181,6 +208,10 @@ impl Drop for App {
         self.github_panel.shutdown();
         self.tool_panel.shutdown();
         self.plugin_panel.shutdown();
+        self.library_panel.shutdown();
+        if let Some((_, panel)) = &mut self.chat_tool {
+            panel.shutdown();
+        }
         self.pending = None;
         self.flush_chats();
     }
@@ -226,6 +257,17 @@ impl Default for App {
             github_open: false,
             tools_open: false,
             plugins_open: false,
+            library_open: false,
+            library_panel: library::LibraryPanel::default(),
+            connectors: Vec::new(),
+            budget_cache: None,
+            mention_cache: None,
+            diff_cache: BTreeMap::new(),
+            chat_tool: None,
+            startup_load: None,
+            reveal: None,
+            reduce_motion: false,
+            theme: theme::ThemeChoice::default(),
             plugin_panel: plugins::PluginPanel::default(),
             tool_panel: ai_tools::ToolPanel::default(),
             github_panel: github_panel::GithubPanel::default(),
@@ -245,10 +287,49 @@ impl App {
             .map(|path| path.with_file_name("chats.json"))
     }
     fn restore_chats(&mut self, merge: bool) {
-        let result = self
-            .archive_path()
-            .ok_or_else(|| "チャット保存先を取得できません".to_owned())
-            .and_then(|path| chat_storage::load(&path));
+        let result = load_archive(self.archive_path());
+        self.apply_restored(result, merge);
+    }
+    /// Read saved chats on a background thread at startup. Saving and the chat
+    /// UI stay blocked until the result arrives, so the archive is never
+    /// overwritten with the empty startup session.
+    fn start_restore(&mut self, ctx: &egui::Context) {
+        let path = self.archive_path();
+        let (tx, rx) = mpsc::channel();
+        let ctx = ctx.clone();
+        std::thread::spawn(move || {
+            let _ = tx.send(load_archive(path));
+            ctx.request_repaint();
+        });
+        self.archive_blocked = true;
+        self.startup_load = Some((rx, std::time::Instant::now()));
+    }
+    /// Apply the startup load when it is ready. Returns true while still loading.
+    fn poll_restore(&mut self) -> bool {
+        let Some((rx, since)) = &self.startup_load else {
+            return false;
+        };
+        let result = match rx.try_recv() {
+            Ok(result) => result,
+            Err(mpsc::TryRecvError::Empty) => return true,
+            Err(mpsc::TryRecvError::Disconnected) => {
+                Err("チャットの読み込みが中断しました。元ファイルは保持しています".into())
+            }
+        };
+        // Cross-fade only when the loading state was actually visible.
+        if since.elapsed() >= LOADING_DELAY && !self.reduce_motion {
+            self.reveal = Some(std::time::Instant::now());
+        }
+        self.startup_load = None;
+        self.apply_restored(result, false);
+        false
+    }
+    fn apply_restored(
+        &mut self,
+        result: Result<Option<chat_storage::Archive>, String>,
+        merge: bool,
+    ) {
+        self.diff_cache.clear();
         match result {
             Ok(Some(mut archive)) => {
                 for session in &mut archive.sessions {
@@ -328,6 +409,20 @@ impl App {
         if self.pending.is_some() {
             return;
         }
+        if self
+            .chat_tool
+            .as_ref()
+            .is_some_and(|(_, panel)| panel.is_busy())
+        {
+            return;
+        }
+        // Message keys shift when a chat is removed.
+        self.diff_cache.clear();
+        match &mut self.chat_tool {
+            Some((index, _)) if *index == self.active => self.chat_tool = None,
+            Some((index, _)) if *index > self.active => *index -= 1,
+            _ => {}
+        }
         self.sessions.remove(self.active);
         if self.sessions.is_empty() {
             self.sessions.push(Session::default());
@@ -339,7 +434,7 @@ impl App {
     }
     fn chat_settings(&mut self, ui: &mut egui::Ui) {
         ui.label("保存ファイルのフルパス（空欄はOS標準のchats.json）");
-        ui.text_edit_singleline(&mut self.archive_path_edit);
+        ui.add(crate::text_field(&mut self.archive_path_edit));
         if ui
             .add_enabled(self.pending.is_none(), egui::Button::new("保存先を適用"))
             .clicked()
@@ -395,7 +490,7 @@ impl App {
         ui.add_space(8.0);
         ui.label("このチャットの名前");
         if ui
-            .text_edit_singleline(&mut self.sessions[self.active].label)
+            .add(crate::text_field(&mut self.sessions[self.active].label))
             .changed()
         {
             self.sessions_dirty = true;
@@ -425,7 +520,7 @@ impl App {
         }
         ui.add_space(8.0);
         ui.label("書き出し先のファイルパス");
-        ui.text_edit_singleline(&mut self.export_path);
+        ui.add(crate::text_field(&mut self.export_path));
         ui.add(crate::checkbox::Checkbox::new(
             &mut self.export_overwrite,
             "書き出し先の既存ファイルの上書きを許可する",
@@ -488,6 +583,9 @@ impl App {
                     app.api_configs = preferences.api_configs;
                     app.local.config = preferences.local;
                     app.github_panel.config = preferences.github;
+                    app.connectors = preferences.connectors;
+                    app.reduce_motion = preferences.reduce_motion;
+                    app.theme = preferences.theme;
                     app.save_chats = preferences.save_chats;
                     app.archive_path_override = preferences.chat_archive_path;
                     app.archive_path_edit = app.archive_path_override.clone();
@@ -500,7 +598,7 @@ impl App {
             }
         }
         if app.save_chats {
-            app.restore_chats(false);
+            app.start_restore(ctx);
         }
         apply_font(ctx, app.font);
         app
@@ -523,11 +621,154 @@ impl App {
                 last_change_root,
                 last_change_journal,
                 github: self.github_panel.config.clone(),
+                connectors: self.connectors.clone(),
+                reduce_motion: self.reduce_motion,
+                theme: self.theme,
             }
             .save(path)
             .err(),
             None => Some("設定の保存先を取得できません。この起動中のみ反映されます。".into()),
         };
+    }
+    /// Startup loading state: the shell's surfaces at once, and after
+    /// `LOADING_DELAY` a skeleton of the chat layout with a progress bar.
+    fn loading_ui(&mut self, ctx: &egui::Context) {
+        let elapsed = self
+            .startup_load
+            .as_ref()
+            .map_or(std::time::Duration::ZERO, |(_, since)| since.elapsed());
+        let visible = elapsed >= LOADING_DELAY;
+        if !visible {
+            ctx.request_repaint_after(LOADING_DELAY - elapsed);
+        } else if self.reduce_motion {
+            // The background thread also requests a repaint when it finishes.
+            ctx.request_repaint_after(std::time::Duration::from_millis(250));
+        } else {
+            ctx.request_repaint();
+        }
+        let seconds = elapsed.as_secs_f32();
+        // Skeleton blocks breathe between 55% and 100% every 0.9 s.
+        let alpha = if self.reduce_motion {
+            1.0
+        } else {
+            0.775 + 0.225 * (seconds * std::f32::consts::TAU / 0.9).cos()
+        };
+        let block = SKELETON().gamma_multiply(alpha);
+        let narrow = ctx.screen_rect().width() < 900.0;
+        if self.sidebar && !narrow {
+            egui::SidePanel::left("sidebar")
+                .exact_width(224.0)
+                .resizable(false)
+                .show_separator_line(false)
+                .frame(egui::Frame::new().fill(SHELL()).inner_margin(egui::Margin {
+                    left: 12,
+                    right: 12,
+                    top: 16,
+                    bottom: 16,
+                }))
+                .show(ctx, |ui| {
+                    if !visible {
+                        return;
+                    }
+                    let rect = ui.max_rect();
+                    let p = ui.painter();
+                    let mut y = rect.top() + 6.0;
+                    let mut bar = |x: f32, w: f32, h: f32, r: f32, gap: f32| {
+                        p.rect_filled(
+                            egui::Rect::from_min_size(
+                                egui::pos2(rect.left() + x, y),
+                                egui::vec2(w, h),
+                            ),
+                            r,
+                            block,
+                        );
+                        y += h + gap;
+                    };
+                    bar(8.0, 96.0, 22.0, 6.0, 26.0); // brand
+                    bar(0.0, 160.0, 52.0, SHAPE_LARGE, 24.0); // new chat
+                    bar(0.0, rect.width(), 40.0, 20.0, 28.0); // search
+                    for width in [rect.width(), 150.0, 170.0] {
+                        bar(0.0, width, 36.0, 18.0, 8.0); // chats
+                    }
+                });
+        }
+        egui::CentralPanel::default()
+            .frame(egui::Frame::new().fill(SHELL()).inner_margin(8.0))
+            .show(ctx, |ui| {
+                let area = ui.max_rect();
+                ui.painter().rect_filled(area, SHAPE_LARGE, SURFACE());
+                if !visible {
+                    return;
+                }
+                // Keep the band inside the pane's rounded corners.
+                let p = ui
+                    .painter()
+                    .with_clip_rect(area.shrink2(egui::vec2(SHAPE_LARGE, 0.0)));
+                // Progress: a 3px band along the pane's top edge.
+                let track = egui::Rect::from_min_size(area.min, egui::vec2(area.width(), 3.0));
+                if self.reduce_motion {
+                    p.rect_filled(track, 0.0, SELECTED());
+                } else {
+                    let phase = (seconds / 1.1).fract();
+                    let width = area.width() * 0.35;
+                    let left = area.left() - width + phase * (area.width() + width);
+                    p.rect_filled(
+                        egui::Rect::from_min_size(
+                            egui::pos2(left, area.top()),
+                            egui::vec2(width, 3.0),
+                        ),
+                        1.5,
+                        ACCENT(),
+                    );
+                }
+                let inner = area.shrink(20.0);
+                let composer_width = (inner.width() - 32.0).clamp(200.0, COMPOSER_WIDTH);
+                let left = inner.center().x - composer_width / 2.0;
+                let top = inner.top() + 56.0 + ((inner.height() - 56.0) * 0.27).max(12.0);
+                let shapes = [
+                    (
+                        egui::pos2(inner.left(), inner.top() + 10.0),
+                        egui::vec2(140.0, 16.0),
+                        6.0,
+                    ),
+                    (egui::pos2(left, top), egui::vec2(220.0, 28.0), 8.0),
+                    (egui::pos2(left, top + 44.0), egui::vec2(300.0, 14.0), 6.0),
+                    (
+                        egui::pos2(left, top + 86.0),
+                        egui::vec2(composer_width, 72.0),
+                        SHAPE_EXTRA_LARGE,
+                    ),
+                ];
+                for (min, size, radius) in shapes {
+                    p.rect_filled(egui::Rect::from_min_size(min, size), radius, block);
+                }
+                // Text for assistive technology and for the reduced-motion case.
+                ui.scope_builder(
+                    egui::UiBuilder::new().max_rect(egui::Rect::from_min_size(
+                        egui::pos2(left, top + 172.0),
+                        egui::vec2(composer_width, 24.0),
+                    )),
+                    |ui| {
+                        ui.label(
+                            RichText::new("保存したチャットを読み込んでいます…")
+                                .size(12.0)
+                                .color(MUTED()),
+                        );
+                    },
+                );
+            });
+    }
+    /// Close every full-page view and return to the chat.
+    fn close_pages(&mut self) {
+        self.settings = false;
+        self.files_open = false;
+        self.changes_open = false;
+        self.commands_open = false;
+        self.git_open = false;
+        self.github_open = false;
+        self.tools_open = false;
+        self.plugins_open = false;
+        self.library_open = false;
     }
     fn new_chat(&mut self) {
         self.sessions.push(Session::default());
@@ -540,6 +781,7 @@ impl App {
         self.github_open = false;
         self.tools_open = false;
         self.plugins_open = false;
+        self.library_open = false;
         self.delete_confirm = false;
         self.sessions_dirty = true;
     }
@@ -583,7 +825,7 @@ impl App {
             }
         };
         let destination = self.destination_key();
-        let messages = match self.sessions[self.active].request_messages(
+        let mut messages = match self.sessions[self.active].request_messages(
             &config,
             &destination,
             self.backend == Backend::Rules,
@@ -594,9 +836,25 @@ impl App {
                 return;
             }
         };
+        // The history keeps the user's own input; skill instructions are added to
+        // this request only.
+        let request_input = messages.last().unwrap().content.clone();
+        if self.backend != Backend::Rules {
+            if let Err(e) = apply_skills(&self.sessions[self.active], &config, &mut messages) {
+                self.sessions[self.active].notice = Some(e);
+                return;
+            }
+        }
+        let tool_mode = self.tools_available() && self.sessions[self.active].use_tools;
+        if tool_mode {
+            if let Err(e) = self.start_chat_tool(ctx, &config, messages.clone()) {
+                self.sessions[self.active].notice = Some(e);
+                return;
+            }
+        }
         self.sessions[self.active].notice = None;
         let input = std::mem::take(&mut self.sessions[self.active].draft);
-        self.sessions[self.active].in_flight_input = Some(messages.last().unwrap().content.clone());
+        self.sessions[self.active].in_flight_input = Some(request_input);
         self.sessions_dirty = true;
         let attachments = std::mem::take(&mut self.sessions[self.active].attachments);
         self.sessions[self.active].analysis_action = None;
@@ -616,6 +874,9 @@ impl App {
         self.sessions[self.active]
             .messages
             .push((true, input.clone()));
+        if tool_mode {
+            return;
+        }
         let backend = self.backend;
         let api = self
             .api_configs
@@ -751,23 +1012,487 @@ impl App {
             api.model
         )
     }
+    /// Configured character budgets: (max_context_chars, max_input_chars).
+    fn budgets(&mut self) -> (usize, usize) {
+        let path = self.config_path.trim().to_owned();
+        if self.budget_cache.as_ref().map(|(p, _, _)| p) != Some(&path) {
+            let config = Config::load(if path.is_empty() {
+                None
+            } else {
+                Some(Path::new(&path))
+            })
+            .unwrap_or_default();
+            self.budget_cache = Some((path, config.max_context_chars, config.max_input_chars));
+        }
+        let (_, context, input) = self.budget_cache.as_ref().unwrap();
+        (*context, *input)
+    }
+    /// What the next chat request would contain, by category.
+    fn context_segments(&mut self) -> (Vec<context_bar::Segment>, usize) {
+        let (budget, _) = self.budgets();
+        let rules = self.backend == Backend::Rules;
+        let workspace = self.sessions[self.active].workspace_root.clone();
+        self.library_panel.ensure_loaded(workspace.as_deref());
+        let session = &self.sessions[self.active];
+        let skills: Vec<_> = self
+            .library_panel
+            .skills
+            .iter()
+            .filter(|s| session.skills.contains(&s.name))
+            .cloned()
+            .collect();
+        let skill_chars = codebot_core::skill_preamble(&skills).chars().count();
+        let history_chars: usize = session
+            .history
+            .iter()
+            .map(|m| m.content.chars().count())
+            .sum();
+        let input = session
+            .analysis_action
+            .map(|action| format!("{}\n\n利用者の依頼:\n{}", action.prompt(), session.draft))
+            .unwrap_or_else(|| session.draft.clone());
+        let input_chars = input.trim().chars().count();
+        let attachment_chars = codebot_core::compose_input(&input, &session.attachments)
+            .map(|t| t.chars().count().saturating_sub(input_chars))
+            .unwrap_or(0);
+        let mut skill = context_bar::Segment::new("スキル", skill_chars, context_bar::SKILLS());
+        if rules && skill_chars > 0 {
+            skill = skill.note("ローカル診断では未使用");
+        }
+        let mut history =
+            context_bar::Segment::new("会話履歴", history_chars, context_bar::HISTORY());
+        if rules {
+            history = history.note("ローカル診断では未使用");
+        } else if !session.history_enabled {
+            history = history.note("履歴送信オフ");
+        }
+        let mut segments = vec![skill, history];
+        if session.use_tools && !matches!(self.backend, Backend::Rules | Backend::Local) {
+            let api = self
+                .api_configs
+                .get(&self.backend)
+                .cloned()
+                .unwrap_or_else(|| self.backend.defaults());
+            let tools = context_bar::Segment::new(
+                "ツール定義",
+                codebot_core::tool_definitions_chars(api.resolved(self.backend).protocol, &[]),
+                context_bar::TOOLS(),
+            );
+            segments.push(if session.connectors.is_empty() {
+                tools
+            } else {
+                tools.note("コネクター分は接続後に追加")
+            });
+        }
+        (
+            vec![
+                segments.remove(0),
+                segments.remove(0),
+                context_bar::Segment::new(
+                    "添付ファイル",
+                    attachment_chars,
+                    context_bar::ATTACHMENTS(),
+                ),
+                context_bar::Segment::new("入力", input_chars, context_bar::INPUT()),
+            ]
+            .into_iter()
+            .chain(segments)
+            .collect(),
+            budget,
+        )
+    }
+    /// Tools need an API destination (not local diagnostics or local AI).
+    fn tools_available(&self) -> bool {
+        !matches!(self.backend, Backend::Rules | Backend::Local)
+    }
+    fn start_chat_tool(
+        &mut self,
+        ctx: &egui::Context,
+        config: &Config,
+        messages: Vec<ChatMessage>,
+    ) -> Result<(), String> {
+        let session = &self.sessions[self.active];
+        let root = session
+            .workspace_root
+            .clone()
+            .ok_or("ツールを使うには作業フォルダを選んでください（ヘッダーの「ファイル」）")?;
+        // The request was already validated with skills added; allow its size here.
+        let mut limits = config.clone();
+        limits.max_input_chars = limits
+            .max_input_chars
+            .max(messages.last().map_or(0, |m| m.content.chars().count()));
+        let connectors = self
+            .connectors
+            .iter()
+            .filter(|c| session.connectors.contains(&c.name))
+            .cloned()
+            .collect();
+        let api = self
+            .api_configs
+            .get(&self.backend)
+            .cloned()
+            .unwrap_or_else(|| self.backend.defaults());
+        let mut panel = Box::<ai_tools::ToolPanel>::default();
+        panel.start_chat(
+            ctx,
+            &root,
+            messages,
+            connectors,
+            &limits,
+            self.backend,
+            &api,
+            &self.api_key,
+        )?;
+        self.chat_tool = Some((self.active, panel));
+        Ok(())
+    }
+    /// Poll the chat tool conversation; write its outcome into the chat when it ends.
+    fn poll_chat_tool(&mut self, ctx: &egui::Context) -> Vec<String> {
+        let Some((index, panel)) = &mut self.chat_tool else {
+            return Vec::new();
+        };
+        let roots = panel.poll(ctx);
+        let index = *index;
+        if let Some(done) = panel.take_finished() {
+            self.chat_tool = None;
+            if let Some(session) = self.sessions.get_mut(index) {
+                let mut text = done.replies.join("\n\n");
+                if let Some(error) = &done.error {
+                    if !text.is_empty() {
+                        text.push_str("\n\n---\n");
+                    }
+                    text.push_str(error);
+                }
+                if text.trim().is_empty() {
+                    text = "（回答はありませんでした）".into();
+                }
+                match (done.error, session.in_flight_input.take()) {
+                    (None, Some(input)) => {
+                        session.retry_input = None;
+                        session.history.extend([
+                            ChatMessage::user(input),
+                            ChatMessage::assistant(text.clone()),
+                        ]);
+                    }
+                    (Some(_), input) => session.retry_input = input,
+                    _ => {}
+                }
+                session.messages.push((false, text));
+                self.sessions_dirty = true;
+            }
+        }
+        roots
+    }
+    /// Files from the chat's workspace that the draft mentions and that are not attached.
+    fn mentioned_files(&mut self) -> Vec<codebot_core::PathMention> {
+        let session = &self.sessions[self.active];
+        let Some(root) = session.workspace_root.clone() else {
+            return Vec::new();
+        };
+        let key = format!("{root}\0{}", session.draft);
+        if self.mention_cache.as_ref().map(|(k, _)| k) != Some(&key) {
+            let mentions = if session.draft.contains(['/', '\\', '.']) {
+                codebot_core::Workspace::open(Path::new(&root))
+                    .and_then(|w| w.mentions(&session.draft, 4))
+                    .unwrap_or_default()
+            } else {
+                Vec::new()
+            };
+            self.mention_cache = Some((key, mentions));
+        }
+        let attached: Vec<&str> = session
+            .attachments
+            .iter()
+            .map(|a| a.path.as_str())
+            .collect();
+        self.mention_cache
+            .as_ref()
+            .map(|(_, m)| {
+                m.iter()
+                    .filter(|m| !attached.contains(&m.path.as_str()))
+                    .cloned()
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+    /// Suggest attaching files the draft mentions, e.g. from a pasted stack trace.
+    fn file_suggestions(&mut self, ui: &mut egui::Ui) {
+        let mentions = self.mentioned_files();
+        if mentions.is_empty() {
+            return;
+        }
+        let mut open = None;
+        ui.horizontal_wrapped(|ui| {
+            ui.label(
+                RichText::new("入力にあるファイル：")
+                    .size(12.0)
+                    .color(MUTED()),
+            );
+            for mention in &mentions {
+                let label = match mention.line {
+                    Some(line) => format!("{}:{line}", mention.path),
+                    None => mention.path.clone(),
+                };
+                if chip(ui, "開く", &label, ATTACHMENTS(), false)
+                    .on_hover_text("参照ファイル画面で前後の行をプレビューし、添付できます")
+                    .clicked()
+                {
+                    open = Some(mention.clone());
+                }
+            }
+        });
+        if let Some(mention) = open {
+            let root = self.sessions[self.active]
+                .workspace_root
+                .clone()
+                .unwrap_or_default();
+            self.workspace_panel
+                .open_file(&root, &mention.path, mention.line);
+            self.close_pages();
+            self.files_open = true;
+        }
+        ui.add_space(4.0);
+    }
+    /// (used, budget) when the next request uses 80% or more of the budget.
+    fn context_warning(&mut self) -> Option<(usize, usize)> {
+        if self.backend == Backend::Rules {
+            return None;
+        }
+        let (segments, budget) = self.context_segments();
+        let used = context_bar::used(&segments);
+        (used * 10 >= budget * 8).then_some((used, budget))
+    }
+    /// Chips for skills and connectors attached to this chat.
+    fn attached_chips(&mut self, ui: &mut egui::Ui) {
+        let history_on = self.history_chip_shown();
+        let tools_on = self.tools_chip_shown();
+        let busy = self.pending.is_some() || self.chat_tool.is_some();
+        let session = &mut self.sessions[self.active];
+        if session.skills.is_empty() && session.connectors.is_empty() && !history_on && !tools_on {
+            return;
+        }
+        let mut remove_skill = None;
+        let mut remove_connector = None;
+        ui.horizontal_wrapped(|ui| {
+            // Send settings stay visible while on; pressing a chip turns it off.
+            if history_on
+                && chip(ui, "送信", "会話履歴を含める", context_bar::HISTORY(), true)
+                    .on_hover_text("過去の会話も送信します。押すとオフにします（「＋」メニューでも切り替え可）")
+                    .clicked()
+                && !busy
+            {
+                session.history_enabled = false;
+            }
+            if tools_on
+                && chip(ui, "送信", "ツールを使う", context_bar::TOOLS(), true)
+                    .on_hover_text("変更案・コマンド・コネクターのツールをAIが提案します。押すとオフにします")
+                    .clicked()
+                && !busy
+            {
+                session.use_tools = false;
+                self.sessions_dirty = true;
+            }
+            for name in &session.skills {
+                if chip(ui, "スキル", name, context_bar::SKILLS(), true)
+                    .on_hover_text("送信時にスキルの指示を依頼の前に付けます")
+                    .clicked()
+                {
+                    remove_skill = Some(name.clone());
+                }
+            }
+            for name in &session.connectors {
+                if chip(ui, "コネクター", name, context_bar::TOOLS(), true)
+                    .on_hover_text("「ツールを使う」がオンのチャットと「AIに作業を相談」で、ツールをAIに提示します")
+                    .clicked()
+                {
+                    remove_connector = Some(name.clone());
+                }
+            }
+        });
+        if let Some(name) = remove_skill {
+            session.skills.retain(|n| *n != name);
+            self.sessions_dirty = true;
+        }
+        if let Some(name) = remove_connector {
+            session.connectors.retain(|n| *n != name);
+            self.sessions_dirty = true;
+        }
+        ui.add_space(4.0);
+    }
+    fn history_chip_shown(&self) -> bool {
+        self.backend != Backend::Rules && self.sessions[self.active].history_enabled
+    }
+    fn tools_chip_shown(&self) -> bool {
+        self.tools_available() && self.sessions[self.active].use_tools
+    }
+    /// Popup from the composer's add button: send settings and library items for this chat.
+    fn attach_menu(&mut self, ui: &mut egui::Ui, button: &egui::Response) {
+        let id = ui.make_persistent_id(("attach-menu", self.active));
+        if button.clicked() {
+            let workspace = self.sessions[self.active].workspace_root.clone();
+            self.library_panel.reload(workspace.as_deref());
+            ui.memory_mut(|m| m.toggle_popup(id));
+        }
+        let above = !self.sessions[self.active].messages.is_empty();
+        let mut open_library = false;
+        let destination = self.destination_key();
+        let rules = self.backend == Backend::Rules;
+        let tools_available = self.tools_available();
+        let pending = self.pending.is_some();
+        let tool_running = self.chat_tool.is_some();
+        egui::popup::popup_above_or_below_widget(
+            ui,
+            id,
+            button,
+            if above {
+                egui::AboveOrBelow::Above
+            } else {
+                egui::AboveOrBelow::Below
+            },
+            egui::PopupCloseBehavior::CloseOnClickOutside,
+            |ui| {
+                ui.set_min_width(260.0);
+                let session = &mut self.sessions[self.active];
+                if !rules {
+                    ui.label(RichText::new("送信の設定").size(12.0).color(MUTED()));
+                    if ui
+                        .add_enabled(
+                            !pending,
+                            checkbox::Checkbox::new(
+                                &mut session.history_enabled,
+                                "会話履歴を含める",
+                            ),
+                        )
+                        .on_hover_text(
+                            "この送信先へ過去の会話も送ります。送信先を変えると再確認します",
+                        )
+                        .changed()
+                        && session.history_enabled
+                    {
+                        session.context_key = Some(destination.clone());
+                        session.notice = None;
+                    }
+                    if tools_available
+                        && ui
+                            .add_enabled(
+                                !pending && !tool_running,
+                                checkbox::Checkbox::new(&mut session.use_tools, "ツールを使う"),
+                            )
+                            .on_hover_text("変更案・コマンド・追加したコネクターのツールをAIが提案します。実行前と結果送信前に確認します。作業フォルダが必要です")
+                            .changed()
+                    {
+                        self.sessions_dirty = true;
+                    }
+                    let history = history_chars(&session.history);
+                    if ui
+                        .add_enabled(
+                            !pending && history > 0,
+                            egui::Button::new(format!("送信用の履歴を消去（{history}文字）")),
+                        )
+                        .on_hover_text("画面の会話と下書きは残ります")
+                        .clicked()
+                    {
+                        session.history.clear();
+                        session.notice = Some(
+                            "送信用の履歴を消去しました。画面の会話と下書きは保持しています。"
+                                .into(),
+                        );
+                        self.sessions_dirty = true;
+                    }
+                    ui.separator();
+                }
+                ui.label(RichText::new("スキル").size(12.0).color(MUTED()));
+                if self.library_panel.skills.is_empty() {
+                    ui.label(
+                        RichText::new("ライブラリにスキルがありません")
+                            .size(13.0)
+                            .color(MUTED()),
+                    );
+                }
+                for skill in &self.library_panel.skills {
+                    let mut on = session.skills.contains(&skill.name);
+                    let response = ui
+                        .add(checkbox::Checkbox::new(&mut on, &skill.name))
+                        .on_hover_text(&skill.description);
+                    if response.changed() {
+                        if on && session.skills.len() < codebot_core::MAX_ATTACHED_SKILLS {
+                            session.skills.push(skill.name.clone());
+                        } else {
+                            session.skills.retain(|n| n != &skill.name);
+                        }
+                        self.sessions_dirty = true;
+                    }
+                }
+                ui.separator();
+                ui.label(RichText::new("コネクター").size(12.0).color(MUTED()));
+                if self.connectors.is_empty() {
+                    ui.label(
+                        RichText::new("登録済みのコネクターがありません")
+                            .size(13.0)
+                            .color(MUTED()),
+                    );
+                }
+                for connector in &self.connectors {
+                    let mut on = session.connectors.contains(&connector.name);
+                    if ui
+                        .add(checkbox::Checkbox::new(&mut on, &connector.name))
+                        .changed()
+                    {
+                        if on && session.connectors.len() < codebot_core::MAX_ATTACHED_CONNECTORS {
+                            session.connectors.push(connector.name.clone());
+                        } else {
+                            session.connectors.retain(|n| n != &connector.name);
+                        }
+                        self.sessions_dirty = true;
+                    }
+                }
+                ui.separator();
+                if ui.button("ライブラリを管理…").clicked() {
+                    open_library = true;
+                }
+            },
+        );
+        if open_library {
+            ui.memory_mut(|m| m.close_popup());
+            self.close_pages();
+            self.library_open = true;
+        }
+    }
     fn composer(&mut self, ui: &mut egui::Ui) {
         let mut remove = None;
         for (index, attachment) in self.sessions[self.active].attachments.iter().enumerate() {
-            ui.horizontal(|ui| {
-                ui.label(format!(
-                    "添付: {}（{}–{}行）",
-                    attachment.path, attachment.first_line, attachment.last_line
-                ));
-                if ui.small_button("外す").clicked() {
-                    remove = Some(index);
-                }
-            });
+            // Material input chip.
+            egui::Frame::new()
+                .stroke(egui::Stroke::new(1.0_f32, BORDER()))
+                .corner_radius(8.0)
+                .inner_margin(egui::Margin {
+                    left: 12,
+                    right: 4,
+                    top: 2,
+                    bottom: 2,
+                })
+                .show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.label(
+                            RichText::new(format!(
+                                "添付: {}（{}–{}行）",
+                                attachment.path, attachment.first_line, attachment.last_line
+                            ))
+                            .size(14.0)
+                            .color(MUTED()),
+                        );
+                        if ui.small_button("外す").clicked() {
+                            remove = Some(index);
+                        }
+                    });
+                });
         }
         if let Some(index) = remove {
             self.sessions[self.active].attachments.remove(index);
             self.sessions_dirty = true;
         }
+        self.attached_chips(ui);
+        self.file_suggestions(ui);
         let enabled = self.pending.is_none()
             && !self.change_panel.is_busy()
             && !self.command_panel.is_busy()
@@ -775,17 +1500,19 @@ impl App {
             && !self.github_panel.is_busy()
             && !self.tool_panel.is_busy()
             && !self.plugin_panel.is_busy()
+            && self.chat_tool.is_none()
             && !self.sessions[self.active].draft.trim().is_empty();
         let input_height = 2.0 * ui.text_style_height(&egui::TextStyle::Body);
         egui::Frame::new()
-            .fill(RAISED)
-            .corner_radius(20.0)
-            .stroke(egui::Stroke::new(1.0_f32, BORDER))
+            .fill(RAISED())
+            .corner_radius(SHAPE_EXTRA_LARGE)
             .inner_margin(egui::Margin::symmetric(18, 16))
             .show(ui, |ui| {
                 ui.horizontal(|ui| {
+                    let add = icon_button(ui, Icon::New, "スキル・コネクターを追加", true, false);
+                    self.attach_menu(ui, &add);
                     let text_width =
-                        (ui.available_width() - 36.0 - ui.spacing().item_spacing.x).max(100.0);
+                        (ui.available_width() - 40.0 - ui.spacing().item_spacing.x).max(100.0);
                     ui.allocate_ui_with_layout(
                         egui::vec2(text_width, input_height),
                         egui::Layout::top_down(egui::Align::Min),
@@ -797,16 +1524,16 @@ impl App {
                                 .auto_shrink([false, false])
                                 .show(ui, |ui| {
                                     let response = ui.add(
-                                        egui::TextEdit::multiline(
-                                            &mut self.sessions[self.active].draft,
-                                        )
-                                        .id_salt(("draft", self.active))
-                                        .hint_text("メッセージを入力")
-                                        .font(egui::TextStyle::Body)
-                                        .desired_width(f32::INFINITY)
-                                        .desired_rows(2)
-                                        .margin(egui::Vec2::ZERO)
-                                        .frame(false),
+                                        crate::text_area(&mut self.sessions[self.active].draft)
+                                            .id_salt(("draft", self.active))
+                                            .hint_text(
+                                                RichText::new("メッセージを入力").color(MUTED()),
+                                            )
+                                            .font(egui::TextStyle::Body)
+                                            .desired_width(f32::INFINITY)
+                                            .desired_rows(2)
+                                            .margin(egui::Vec2::ZERO)
+                                            .frame(false),
                                     );
                                     response.widget_info(|| {
                                         egui::WidgetInfo::labeled(
@@ -830,7 +1557,7 @@ impl App {
                     }
                 });
             });
-        ui.add_space(10.0);
+        ui.add_space(4.0);
         ui.horizontal(|ui| {
             let notice = if self.pending.is_some() {
                 if self
@@ -858,9 +1585,10 @@ impl App {
                     }
                 )
             };
-            ui.label(RichText::new(notice).size(12.0).color(MUTED));
-            if ui.available_width() > 120.0 {
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            ui.label(RichText::new(notice).size(12.0).color(MUTED()));
+            let (segments, budget) = self.context_segments();
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if ui.available_width() > 220.0 {
                     ui.label(
                         RichText::new(if cfg!(target_os = "macos") {
                             "⌘ Enter"
@@ -868,60 +1596,58 @@ impl App {
                             "Ctrl + Enter"
                         })
                         .size(11.0)
-                        .color(MUTED),
+                        .color(MUTED()),
                     );
-                });
-            }
+                    ui.add_space(8.0);
+                }
+                if ui.available_width() > 110.0 {
+                    context_bar::compact(ui, &segments, budget);
+                }
+            });
         });
-        if self.backend != Backend::Rules {
-            let destination = self.destination_key();
-            ui.horizontal(|ui| {
-                let session = &mut self.sessions[self.active];
-                if ui
-                    .add_enabled(
-                        self.pending.is_none(),
-                        crate::checkbox::Checkbox::new(
-                            &mut session.history_enabled,
-                            "会話履歴を含める",
-                        ),
-                    )
-                    .changed()
-                    && session.history_enabled
-                {
-                    session.context_key = Some(destination);
-                    session.notice = None;
-                }
-                if ui
-                    .add_enabled(
-                        self.pending.is_none(),
-                        egui::Button::new("送信用の履歴を消去"),
-                    )
-                    .clicked()
-                {
-                    session.history.clear();
-                    session.notice = Some(
-                        "送信用の履歴を消去しました。画面の会話と下書きは保持しています。".into(),
-                    );
-                }
+        if let Some((used, budget)) = self.context_warning() {
+            let pending = self.pending.is_some();
+            let session = &mut self.sessions[self.active];
+            ui.horizontal_wrapped(|ui| {
                 ui.label(
-                    RichText::new(format!(
-                        "{}文字",
-                        session
-                            .history
-                            .iter()
-                            .map(|m| m.content.chars().count())
-                            .sum::<usize>()
-                    ))
+                    RichText::new(if used > budget {
+                        "送信できる量（max_context_chars）を超えています。"
+                    } else {
+                        "コンテキストが上限の80%を超えました。"
+                    })
                     .size(12.0)
-                    .color(MUTED),
+                    .color(if used > budget { ERROR() } else { MUTED() }),
                 );
+                if session.history_enabled && session.history.len() >= 2 {
+                    let others = used.saturating_sub(history_chars(&session.history));
+                    let allowed = (budget * 6 / 10).saturating_sub(others);
+                    if ui
+                        .add_enabled(!pending, egui::Button::new("古い履歴を外す"))
+                        .on_hover_text("送信用の履歴から古い往復を外し、使用量を60%以下にします。画面の会話は残ります。")
+                        .clicked()
+                    {
+                        let removed = trim_history(&mut session.history, allowed);
+                        session.notice = Some(format!(
+                            "送信用の履歴から古い{removed}往復を外しました。画面の会話は残っています。"
+                        ));
+                        self.sessions_dirty = true;
+                    }
+                } else if !session.attachments.is_empty() {
+                    ui.label(RichText::new("添付する行の範囲を狭めると減らせます。").size(12.0).color(MUTED()));
+                }
             });
         }
         if let Some(notice) = &self.sessions[self.active].notice {
-            ui.label(RichText::new(notice).size(12.0).color(MUTED));
+            ui.label(RichText::new(notice).size(12.0).color(MUTED()));
         }
     }
     fn conversation(&mut self, ui: &mut egui::Ui) {
+        let can_mutate = !self.change_panel.is_busy()
+            && !self.command_panel.is_busy()
+            && !self.git_panel.is_busy()
+            && !self.github_panel.is_busy()
+            && !self.tool_panel.is_busy()
+            && !self.plugin_panel.is_busy();
         let mut reference = None;
         let mut retry = false;
         let mut proposal_open = None;
@@ -939,14 +1665,21 @@ impl App {
                         ui.horizontal(|ui| {
                             ui.add_space((ui.available_width() - width - 10.0).max(0.0));
                             egui::Frame::new()
-                                .fill(SELECTED)
-                                .corner_radius(12.0)
-                                .inner_margin(16.0)
+                                .fill(PRIMARY_CONTAINER())
+                                .corner_radius(egui::CornerRadius {
+                                    nw: 20,
+                                    ne: 20,
+                                    sw: 20,
+                                    se: 4,
+                                })
+                                .inner_margin(egui::Margin::symmetric(18, 14))
                                 .show(ui, |ui| {
-                                    ui.set_width((width - 32.0).max(50.0));
+                                    ui.set_width((width - 36.0).max(50.0));
                                     ui.add(
                                         egui::Label::new(
-                                            RichText::new(message).line_height(Some(22.0)),
+                                            RichText::new(message)
+                                                .line_height(Some(22.0))
+                                                .color(ON_PRIMARY_CONTAINER()),
                                         )
                                         .wrap()
                                         .selectable(true),
@@ -970,6 +1703,43 @@ impl App {
                         {
                             reference = Some(uri);
                         }
+                        if body.contains("\"changes\"") && body.contains("\"version\"") {
+                            let key = (self.active, index);
+                            let root = self.sessions[self.active].workspace_root.clone();
+                            egui::CollapsingHeader::new("変更案の差分を表示")
+                                .id_salt(("inline-diff", key))
+                                .show(ui, |ui| {
+                                    let Some(root) = root else {
+                                        ui.label(RichText::new("作業フォルダを選ぶと差分を表示できます（「ファイル」で選択）。").size(13.0).color(MUTED()));
+                                        return;
+                                    };
+                                    let result = self.diff_cache.entry(key).or_insert_with(|| {
+                                        codebot_core::ChangeProposal::parse(body).and_then(|proposal| {
+                                            codebot_core::prepare_changes(Path::new(&root), &proposal)
+                                                .map(|prepared| prepared.previews())
+                                        })
+                                    });
+                                    match result {
+                                        Ok(previews) => {
+                                            for preview in previews.iter() {
+                                                ui.label(RichText::new(&preview.path).monospace().size(13.0));
+                                                egui::ScrollArea::both()
+                                                    .id_salt(("inline-diff-body", key, &preview.path))
+                                                    .max_height(280.0)
+                                                    .show(ui, |ui| {
+                                                        ui.add(egui::Label::new(change_panel::diff_job(&preview.diff)).extend());
+                                                    });
+                                            }
+                                        }
+                                        Err(error) => {
+                                            ui.colored_label(ERROR(), error.as_str());
+                                        }
+                                    }
+                                    if ui.small_button("ファイルの現状で再計算").clicked() {
+                                        self.diff_cache.remove(&key);
+                                    }
+                                });
+                        }
                         ui.add_space(8.0);
                         ui.horizontal(|ui| {
                             if icon_button(ui, Icon::Copy, "回答をコピー", true, false).clicked()
@@ -978,7 +1748,7 @@ impl App {
                                 self.copied = Some((self.active, index));
                             }
                             if self.copied == Some((self.active, index)) {
-                                ui.label(RichText::new("コピーしました").size(12.0).color(MUTED));
+                                ui.label(RichText::new("コピーしました").size(12.0).color(MUTED()));
                             }
                             if body.contains("\"changes\"")
                                 && body.contains("\"version\"")
@@ -1001,13 +1771,19 @@ impl App {
                     }
                     ui.add_space(14.0);
                 }
+                if let Some((index, panel)) = &mut self.chat_tool {
+                    if *index == self.active {
+                        ui.add_space(16.0);
+                        panel.chat_ui(ui, can_mutate);
+                    }
+                }
                 if self
                     .pending
                     .as_ref()
                     .is_some_and(|(id, _)| *id == self.active)
                 {
                     ui.add_space(20.0);
-                    ui.label(RichText::new("生成中…").color(MUTED));
+                    ui.label(RichText::new("生成中…").color(MUTED()));
                 }
             });
         if let Some(uri) = reference {
@@ -1089,7 +1865,7 @@ impl App {
             ui.label(
                 RichText::new("APIキー不要。入力は外部に送信されません。")
                     .size(13.0)
-                    .color(MUTED),
+                    .color(MUTED()),
             );
             return;
         }
@@ -1100,7 +1876,7 @@ impl App {
         ui.add_space(12.0);
         let model = ui.label("モデルID（必須）");
         ui.add(
-            egui::TextEdit::singleline(&mut api.model)
+            crate::text_field(&mut api.model)
                 .desired_width(f32::INFINITY)
                 .hint_text("契約先で利用可能なモデルID"),
         )
@@ -1129,7 +1905,7 @@ impl App {
         ui.add_space(8.0);
         let endpoint = ui.label("APIベースURL（地域・契約に合わせて変更可能）");
         let edited = ui
-            .add(egui::TextEdit::singleline(&mut api.base_url).desired_width(f32::INFINITY))
+            .add(crate::text_field(&mut api.base_url).desired_width(f32::INFINITY))
             .labelled_by(endpoint.id);
         if edited.changed() {
             self.api_key.clear();
@@ -1146,19 +1922,19 @@ impl App {
                 }
             })
             .size(12.0)
-            .color(MUTED),
+            .color(MUTED()),
         );
         ui.add_space(8.0);
         let key = ui.label("APIキー（保存されません）");
         ui.add(
-            egui::TextEdit::singleline(&mut self.api_key)
+            crate::text_field(&mut self.api_key)
                 .password(true)
                 .desired_width(f32::INFINITY)
                 .hint_text("この起動中だけ使用。未入力なら環境変数を参照"),
         )
         .labelled_by(key.id);
         let env = ui.label("APIキーの環境変数名");
-        ui.add(egui::TextEdit::singleline(&mut api.api_key_env).desired_width(f32::INFINITY))
+        ui.add(crate::text_field(&mut api.api_key_env).desired_width(f32::INFINITY))
             .labelled_by(env.id);
         if self.backend == Backend::Custom {
             ui.add(crate::checkbox::Checkbox::new(
@@ -1173,7 +1949,7 @@ impl App {
             ui.add(egui::DragValue::new(&mut api.timeout_seconds).range(1..=300));
         });
         ui.add_space(8.0);
-        ui.label(RichText::new("送信時は今回の入力と選択した添付を上記URLに送ります。履歴送信を有効にした場合は過去の会話も含みます。利用料金は各サービスに従います。").size(12.0).color(MUTED));
+        ui.label(RichText::new("送信時は今回の入力と選択した添付を上記URLに送ります。履歴送信を有効にした場合は過去の会話も含みます。利用料金は各サービスに従います。").size(12.0).color(MUTED()));
         self.api_diagnostics
             .ui(ui, self.backend, api, &self.api_key, self.pending.is_none());
         if ui.button("API設定を保存").clicked() {
@@ -1199,12 +1975,16 @@ impl App {
                 .family(egui::FontFamily::Name("ui-bold".into())),
         );
         let previous = self.font;
-        ui.radio_value(
+        ui.add(crate::checkbox::Radio::new(
             &mut self.font,
             FontChoice::LineSeedJp,
             "LINE Seed JP — Regular 400（標準）",
-        );
-        ui.radio_value(&mut self.font, FontChoice::BizUdpGothic, "BIZ UDPゴシック");
+        ));
+        ui.add(crate::checkbox::Radio::new(
+            &mut self.font,
+            FontChoice::BizUdpGothic,
+            "BIZ UDPゴシック",
+        ));
         if self.font != previous {
             self.save_font_choice(ui.ctx());
         }
@@ -1214,9 +1994,45 @@ impl App {
             ui.label(
                 RichText::new("すぐに反映され、次回起動にも引き継がれます。")
                     .size(13.0)
-                    .color(MUTED),
+                    .color(MUTED()),
             );
         }
+        ui.add_space(28.0);
+        ui.label(
+            RichText::new("表示")
+                .size(14.0)
+                .family(egui::FontFamily::Name("ui-bold".into())),
+        );
+        let previous = self.theme;
+        ui.horizontal_wrapped(|ui| {
+            for (choice, label) in [
+                (theme::ThemeChoice::Light, "ライト（標準）"),
+                (theme::ThemeChoice::Dark, "ダーク"),
+                (theme::ThemeChoice::System, "OSに合わせる"),
+            ] {
+                ui.add(crate::checkbox::Radio::new(&mut self.theme, choice, label));
+            }
+        });
+        if self.theme != previous {
+            theme::apply(ui.ctx(), theme::wants_dark(ui.ctx(), self.theme));
+            self.save_preferences();
+        }
+        if ui
+            .add(crate::checkbox::Checkbox::new(
+                &mut self.reduce_motion,
+                "動きを減らす",
+            ))
+            .changed()
+        {
+            self.save_preferences();
+        }
+        ui.label(
+            RichText::new(
+                "起動時の読み込み表示で、明滅・進捗バーの移動・切り替え時のフェードを止めます。",
+            )
+            .size(13.0)
+            .color(MUTED()),
+        );
         ui.add_space(28.0);
         let label = ui.label(
             RichText::new("設定ファイル")
@@ -1226,18 +2042,18 @@ impl App {
         ui.label(
             RichText::new("使用するTOMLファイルのパスを指定します。")
                 .size(13.0)
-                .color(MUTED),
+                .color(MUTED()),
         );
         ui.add_space(8.0);
         ui.add(
-            egui::TextEdit::singleline(&mut self.config_path)
+            crate::text_field(&mut self.config_path)
                 .desired_width(f32::INFINITY)
                 .hint_text("OS標準の設定を使用")
                 .margin(egui::vec2(12.0, 10.0)),
         )
         .labelled_by(label.id);
         ui.add_space(8.0);
-        ui.label(RichText::new("空欄の場合はOS標準の設定、または既定値を使います。\n変更は次の送信から適用されます。").size(13.0).color(MUTED));
+        ui.label(RichText::new("空欄の場合はOS標準の設定、または既定値を使います。\n変更は次の送信から適用されます。").size(13.0).color(MUTED()));
         ui.add_space(28.0);
         if ui.button("チャットに戻る").clicked() {
             self.settings = false;
@@ -1246,8 +2062,31 @@ impl App {
 }
 impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _: &mut eframe::Frame) {
+        // "OSに合わせる" follows the OS preference while the app runs.
+        let dark = theme::wants_dark(ctx, self.theme);
+        if dark != theme::is_dark() {
+            theme::apply(ctx, dark);
+        }
+        if self.poll_restore() {
+            self.loading_ui(ctx);
+            return;
+        }
+        let reveal = match self.reveal {
+            Some(start) => {
+                let t = start.elapsed().as_secs_f32() * 1000.0 / REVEAL_MS;
+                if t >= 1.0 {
+                    self.reveal = None;
+                    1.0
+                } else {
+                    ctx.request_repaint();
+                    egui::emath::easing::cubic_out(t)
+                }
+            }
+            None => 1.0,
+        };
         self.poll();
         self.github_panel.poll();
+        self.library_panel.poll();
         for root in [
             self.change_panel.poll(),
             self.command_panel.poll(),
@@ -1257,6 +2096,7 @@ impl eframe::App for App {
         .flatten()
         .chain(self.tool_panel.poll(ctx))
         .chain(self.plugin_panel.poll(ctx))
+        .chain(self.poll_chat_tool(ctx))
         {
             for session in &mut self.sessions {
                 if session.workspace_root.as_deref() == Some(&root) {
@@ -1296,6 +2136,7 @@ impl eframe::App for App {
             && !self.github_open
             && !self.tools_open
             && !self.plugins_open
+            && !self.library_open
             && ctx.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::Enter))
         {
             self.send(ctx);
@@ -1305,13 +2146,21 @@ impl eframe::App for App {
             egui::SidePanel::left("sidebar")
                 .exact_width(224.0)
                 .resizable(false)
-                .frame(egui::Frame::new().fill(SHELL).inner_margin(16.0))
+                .show_separator_line(false)
+                .frame(egui::Frame::new().fill(SHELL()).inner_margin(egui::Margin {
+                    left: 12,
+                    right: 12,
+                    top: 16,
+                    bottom: 16,
+                }))
                 .show(ctx, |ui| {
-                    ui.add_space(8.0);
+                    ui.multiply_opacity(reveal);
+                    ui.add_space(4.0);
                     ui.horizontal(|ui| {
+                        ui.add_space(8.0);
                         ui.label(
                             RichText::new("CodeBot")
-                                .size(20.0)
+                                .size(22.0)
                                 .family(egui::FontFamily::Name("ui-bold".into())),
                         );
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -1322,18 +2171,18 @@ impl eframe::App for App {
                             }
                         });
                     });
-                    ui.add_space(26.0);
+                    ui.add_space(20.0);
                     if new_chat_button(ui).clicked() {
                         self.new_chat();
                     }
-                    ui.add_space(30.0);
-                    ui.label(RichText::new("チャット").size(12.0).color(MUTED));
-                    ui.add(
-                        egui::TextEdit::singleline(&mut self.search)
-                            .hint_text("チャットを検索")
-                            .desired_width(192.0),
-                    );
-                    ui.add_space(8.0);
+                    ui.add_space(24.0);
+                    search_bar(ui, &mut self.search);
+                    ui.add_space(16.0);
+                    ui.horizontal(|ui| {
+                        ui.add_space(16.0);
+                        ui.label(RichText::new("チャット").size(14.0).color(MUTED()));
+                    });
+                    ui.add_space(2.0);
                     egui::ScrollArea::vertical()
                         .max_height((ui.available_height() - 106.0).max(40.0))
                         .show(ui, |ui| {
@@ -1341,16 +2190,10 @@ impl eframe::App for App {
                                 if !session.matches(&self.search) {
                                     continue;
                                 }
-                                let response = ui.add(
-                                    egui::Button::new(RichText::new(session.title()).size(13.0))
-                                        .truncate()
-                                        .min_size(egui::vec2(192.0, 36.0))
-                                        .shortcut_text("")
-                                        .fill(if index == self.active && !self.settings {
-                                            SELECTED
-                                        } else {
-                                            Color32::TRANSPARENT
-                                        }),
+                                let response = drawer_item(
+                                    ui,
+                                    &session.title(),
+                                    index == self.active && !self.settings,
                                 );
                                 response.widget_info(|| {
                                     egui::WidgetInfo::selected(
@@ -1370,35 +2213,27 @@ impl eframe::App for App {
                                     self.github_open = false;
                                     self.tools_open = false;
                                     self.plugins_open = false;
+                                    self.library_open = false;
                                     self.delete_confirm = false;
                                     self.sessions_dirty = true;
                                 }
                             }
                         });
                     ui.with_layout(egui::Layout::bottom_up(egui::Align::LEFT), |ui| {
-                        ui.label(
-                            RichText::new(if self.save_chats {
-                                "チャットをこのPCに保存します"
-                            } else {
-                                "履歴は終了時に消去されます"
-                            })
-                            .size(11.0)
-                            .color(MUTED),
-                        );
-                        ui.add_space(10.0);
-                        if ui
-                            .add(
-                                egui::Button::new("設定")
-                                    .min_size(egui::vec2(192.0, 36.0))
-                                    .shortcut_text("")
-                                    .fill(if self.settings {
-                                        SELECTED
-                                    } else {
-                                        Color32::TRANSPARENT
-                                    }),
-                            )
-                            .clicked()
-                        {
+                        ui.horizontal(|ui| {
+                            ui.add_space(16.0);
+                            ui.label(
+                                RichText::new(if self.save_chats {
+                                    "チャットをこのPCに保存します"
+                                } else {
+                                    "履歴は終了時に消去されます"
+                                })
+                                .size(12.0)
+                                .color(MUTED()),
+                            );
+                        });
+                        ui.add_space(8.0);
+                        if drawer_item(ui, "設定", self.settings).clicked() {
                             self.settings = true;
                             self.files_open = false;
                             self.changes_open = false;
@@ -1407,16 +2242,18 @@ impl eframe::App for App {
                             self.github_open = false;
                             self.tools_open = false;
                             self.plugins_open = false;
+                            self.library_open = false;
                         }
                     });
                 });
         }
         egui::CentralPanel::default()
-            .frame(egui::Frame::new().fill(SHELL).inner_margin(8.0))
+            .frame(egui::Frame::new().fill(SHELL()).inner_margin(8.0))
             .show(ctx, |ui| {
                 let area = ui.max_rect();
-                ui.painter().rect_filled(area, 12.0, SURFACE);
+                ui.painter().rect_filled(area, SHAPE_LARGE, SURFACE());
                 ui.scope_builder(egui::UiBuilder::new().max_rect(area.shrink(20.0)), |ui| {
+                    ui.multiply_opacity(reveal);
                     ui.horizontal(|ui| {
                         if !self.sidebar
                             && !narrow
@@ -1432,7 +2269,7 @@ impl eframe::App for App {
                                     ui.close_menu();
                                 }
                                 ui.add(
-                                    egui::TextEdit::singleline(&mut self.search)
+                                    crate::text_field(&mut self.search)
                                         .hint_text("チャットを検索"),
                                 );
                                 for (i, s) in self.sessions.iter().enumerate() {
@@ -1443,7 +2280,7 @@ impl eframe::App for App {
                                         self.active = i;
                                         self.settings = false;
                                         self.files_open = false;
-                                        self.changes_open = false; self.commands_open = false; self.git_open=false; self.github_open=false; self.tools_open=false;self.plugins_open=false;
+                                        self.changes_open = false; self.commands_open = false; self.git_open=false; self.github_open=false; self.tools_open=false;self.plugins_open=false; self.library_open = false;
                                         self.delete_confirm = false;
                                         self.sessions_dirty = true;
                                         ui.close_menu();
@@ -1451,50 +2288,81 @@ impl eframe::App for App {
                                 }
                             });
                         }
-                        let title = if self.plugins_open {"拡張機能".into()} else if self.tools_open {"AIに作業を相談".into()} else if self.settings { "設定".into() } else if self.github_open { "GitHub".into() } else if self.git_open { "Git".into() } else if self.commands_open { "コマンドの実行".into() } else if self.changes_open { "変更の確認".into() }
+                        let title = if self.library_open {"ライブラリ".into()} else if self.plugins_open {"拡張機能".into()} else if self.tools_open {"AIに作業を相談".into()} else if self.settings { "設定".into() } else if self.github_open { "GitHub".into() } else if self.git_open { "Git".into() } else if self.commands_open { "コマンドの実行".into() } else if self.changes_open { "変更の確認".into() }
                             else if self.files_open { "参照ファイル".into() } else { self.sessions[self.active].title() };
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                             if icon_button(ui, Icon::Settings, "設定", true, false).clicked() {
                                 self.files_open = false;
-                                self.changes_open = false; self.commands_open = false; self.git_open=false; self.github_open=false; self.tools_open=false;self.plugins_open=false;
+                                self.changes_open = false; self.commands_open = false; self.git_open=false; self.github_open=false; self.tools_open=false;self.plugins_open=false; self.library_open = false;
                                 self.settings = !self.settings;
                             }
                             if icon_button(ui, Icon::New, "新しいチャット", true, false).clicked()
                             {
                                 self.new_chat();
                             }
-                            if ui.button("ファイル").clicked() { self.files_open = !self.files_open; self.settings = false; self.changes_open = false; self.commands_open = false; self.git_open=false; self.github_open=false; self.tools_open=false;self.plugins_open=false; }
-                            if ui.button("変更").clicked() { self.changes_open = !self.changes_open; self.settings = false; self.files_open = false; self.commands_open=false; self.git_open=false; self.github_open=false; self.tools_open=false;self.plugins_open=false; }
-                            ui.menu_button("実行",|ui| {
-                                if ui.button("コマンドを確認して実行").clicked() {self.commands_open=true;self.tools_open=false;self.plugins_open=false;self.settings=false;self.files_open=false;self.changes_open=false;self.git_open=false;self.github_open=false;self.command_panel.set_initial_root(self.sessions[self.active].workspace_root.as_deref());ui.close_menu();}
+                            if tab_button(ui, "ファイル", self.files_open).clicked() { self.workspace_panel.set_root_if_empty(self.sessions[self.active].workspace_root.as_deref()); self.files_open = !self.files_open; self.settings = false; self.changes_open = false; self.commands_open = false; self.git_open=false; self.github_open=false; self.tools_open=false;self.plugins_open=false; self.library_open = false; }
+                            if tab_button(ui, "ライブラリ", self.library_open).clicked() {
+                                let open = !self.library_open;
+                                self.close_pages();
+                                self.library_open = open;
+                                let workspace = self.sessions[self.active].workspace_root.clone();
+                                self.library_panel.reload(workspace.as_deref());
+                            }
+                            if tab_button(ui, "変更", self.changes_open).clicked() { self.changes_open = !self.changes_open; self.settings = false; self.files_open = false; self.commands_open=false; self.git_open=false; self.github_open=false; self.tools_open=false;self.plugins_open=false; self.library_open = false; }
+                            let run_menu = tab_button(ui, "実行", self.commands_open || self.tools_open || self.plugins_open);
+                            let run_menu_id = ui.make_persistent_id("run-menu");
+                            if run_menu.clicked() { ui.memory_mut(|m| m.toggle_popup(run_menu_id)); }
+                            egui::popup_below_widget(ui, run_menu_id, &run_menu, egui::PopupCloseBehavior::CloseOnClick, |ui| {
+                                ui.set_min_width(200.0);
+                                ui.style_mut().visuals.button_frame = false;
+                                if ui.button("コマンドを確認して実行").clicked() {self.commands_open=true;self.tools_open=false;self.plugins_open=false; self.library_open = false;self.settings=false;self.files_open=false;self.changes_open=false;self.git_open=false;self.github_open=false;self.command_panel.set_initial_root(self.sessions[self.active].workspace_root.as_deref());ui.close_menu();}
                                 if ui.button("AIに作業を相談").clicked() {
                                     let session=&self.sessions[self.active];let prompt=codebot_core::compose_input(&session.draft,&session.attachments).unwrap_or_else(|_|session.draft.clone());
-                                    self.tool_panel.set_initial(session.workspace_root.as_deref(),&prompt);
-                                    self.commands_open=false;self.settings=false;self.files_open=false;self.changes_open=false;self.git_open=false;self.github_open=false;self.tools_open=true;self.plugins_open=false;ui.close_menu();
+                                    let connectors=self.connectors.iter().filter(|c|session.connectors.contains(&c.name)).cloned().collect();
+                                    self.tool_panel.set_initial(session.workspace_root.as_deref(),&prompt,session.skills.clone(),connectors);
+                                    self.commands_open=false;self.settings=false;self.files_open=false;self.changes_open=false;self.git_open=false;self.github_open=false;self.tools_open=true;self.plugins_open=false; self.library_open = false;ui.close_menu();
                                 }
                                 if ui.button("拡張機能").clicked() {
                                     let session=&self.sessions[self.active];self.plugin_panel.set_initial(session.workspace_root.as_deref(),&session.draft,&session.attachments);
-                                    self.commands_open=false;self.settings=false;self.files_open=false;self.changes_open=false;self.git_open=false;self.github_open=false;self.tools_open=false;self.plugins_open=true;ui.close_menu();
+                                    self.commands_open=false;self.settings=false;self.files_open=false;self.changes_open=false;self.git_open=false;self.github_open=false;self.tools_open=false;self.plugins_open=true; self.library_open = false;ui.close_menu();
                                 }
                             });
-                            if ui.button("Git").clicked() { self.git_open=!self.git_open; self.github_open=false; self.tools_open=false;self.plugins_open=false; self.settings=false; self.files_open=false; self.changes_open=false; self.commands_open=false; self.git_panel.set_initial_root(self.sessions[self.active].workspace_root.as_deref()); }
-                            if ui.button("GitHub").clicked() { self.github_open=!self.github_open;self.tools_open=false;self.plugins_open=false; self.git_open=false; self.settings=false; self.files_open=false; self.changes_open=false; self.commands_open=false; }
+                            if tab_button(ui, "Git", self.git_open).clicked() { self.git_open=!self.git_open; self.github_open=false; self.tools_open=false;self.plugins_open=false; self.library_open = false; self.settings=false; self.files_open=false; self.changes_open=false; self.commands_open=false; self.git_panel.set_initial_root(self.sessions[self.active].workspace_root.as_deref()); }
+                            if tab_button(ui, "GitHub", self.github_open).clicked() { self.github_open=!self.github_open;self.tools_open=false;self.plugins_open=false; self.library_open = false; self.git_open=false; self.settings=false; self.files_open=false; self.changes_open=false; self.commands_open=false; }
                             ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
-                                ui.add(egui::Label::new(RichText::new(title).size(13.0).color(MUTED)).truncate());
+                                ui.add(egui::Label::new(RichText::new(title).size(16.0).color(TEXT())).truncate());
                             });
                         });
                     });
+                    ui.add_space(12.0);
                     let bounds = ui.available_rect_before_wrap();
                     let width = (bounds.width() - 32.0).min(MEASURE).max(200.0);
                     let left = bounds.center().x - width / 2.0;
                     let composer_width = (bounds.width() - 32.0).min(COMPOSER_WIDTH).max(200.0);
                     let composer_left = bounds.center().x - composer_width / 2.0;
-                    if self.plugins_open {
+                    if self.library_open {
+                        let rect=egui::Rect::from_min_max(egui::pos2(left,bounds.top()),egui::pos2(left+width,bounds.bottom()));
+                        ui.scope_builder(egui::UiBuilder::new().max_rect(rect),|ui| {
+                            egui::ScrollArea::vertical().id_salt("library-page").show(ui,|ui| {
+                                let session = &mut self.sessions[self.active];
+                                let changes = self.library_panel.ui(ui, &mut self.connectors, library::Target {
+                                    skills: &mut session.skills,
+                                    connectors: &mut session.connectors,
+                                    workspace: session.workspace_root.as_deref(),
+                                });
+                                if changes.session { self.sessions_dirty = true; }
+                                if changes.preferences { self.save_preferences(); }
+                                if let Some(error) = &self.preferences_error { ui.colored_label(ui.visuals().error_fg_color, error); }
+                                ui.add_space(8.0);
+                                if ui.button("チャットに戻る").clicked() { self.library_open = false; }
+                            });
+                        });
+                    } else if self.plugins_open {
                         let rect=egui::Rect::from_min_max(egui::pos2(left,bounds.top()),egui::pos2(left+width,bounds.bottom()));
                         ui.scope_builder(egui::UiBuilder::new().max_rect(rect),|ui| {
                             egui::ScrollArea::vertical().show(ui,|ui| {
                                 self.plugin_panel.ui(ui,self.pending.is_none()&&!self.change_panel.is_busy()&&!self.command_panel.is_busy()&&!self.git_panel.is_busy()&&!self.github_panel.is_busy()&&!self.tool_panel.is_busy());
-                                if ui.button("チャットに戻る").clicked() {self.plugins_open=false;}
+                                if ui.button("チャットに戻る").clicked() {self.plugins_open=false; self.library_open = false;}
                             });
                         });
                     } else if self.tools_open {
@@ -1509,7 +2377,7 @@ impl eframe::App for App {
                                     },
                                     Err(error)=>{ui.label(error);}
                                 }
-                                if ui.button("チャットに戻る").clicked() {self.tools_open=false;self.plugins_open=false;}
+                                if ui.button("チャットに戻る").clicked() {self.tools_open=false;self.plugins_open=false; self.library_open = false;}
                             });
                         });
                     } else if self.github_open {
@@ -1521,17 +2389,17 @@ impl eframe::App for App {
                                         github_panel::Action::Save=>self.save_preferences(),
                                         github_panel::Action::Attach(text)=>{
                                             let mut limited=text.chars().take(12000).collect::<String>();if text.chars().count()>12000 {limited.push_str("\n（12000文字以降を省略）");}
-                                            let session=&mut self.sessions[self.active];if !session.draft.is_empty() {session.draft.push_str("\n\n");}session.draft.push_str(&limited);session.history_enabled=false;session.notice=Some("GitHubの資料を下書きに追加しました。内容を確認して送信してください。".into());self.sessions_dirty=true;self.github_open=false; self.tools_open=false;self.plugins_open=false;
+                                            let session=&mut self.sessions[self.active];if !session.draft.is_empty() {session.draft.push_str("\n\n");}session.draft.push_str(&limited);session.history_enabled=false;session.notice=Some("GitHubの資料を下書きに追加しました。内容を確認して送信してください。".into());self.sessions_dirty=true;self.github_open=false; self.tools_open=false;self.plugins_open=false; self.library_open = false;
                                         }
                                         github_panel::Action::Branch{branch,source}=>{
                                             match self.git_panel.prepare_issue_branch(ui.ctx(),self.sessions[self.active].workspace_root.as_deref(),&branch,&source) {
-                                                Ok(())=>{self.git_open=true;self.github_open=false; self.tools_open=false;self.plugins_open=false;},Err(error)=>self.github_panel.report_message(error)
+                                                Ok(())=>{self.git_open=true;self.github_open=false; self.tools_open=false;self.plugins_open=false; self.library_open = false;},Err(error)=>self.github_panel.report_message(error)
                                             }
                                         }
                                     }
                                 }
                                 if let Some(error)=&self.preferences_error {ui.colored_label(ui.visuals().error_fg_color,error);}
-                                if ui.button("チャットに戻る").clicked() {self.github_open=false; self.tools_open=false;self.plugins_open=false;}
+                                if ui.button("チャットに戻る").clicked() {self.github_open=false; self.tools_open=false;self.plugins_open=false; self.library_open = false;}
                             });
                         });
                     } else if self.git_open {
@@ -1539,7 +2407,7 @@ impl eframe::App for App {
                         ui.scope_builder(egui::UiBuilder::new().max_rect(rect),|ui| {
                             egui::ScrollArea::vertical().show(ui,|ui| {
                                 self.git_panel.ui(ui,self.pending.is_none() && !self.change_panel.is_busy() && !self.command_panel.is_busy() && !self.github_panel.is_busy() && !self.tool_panel.is_busy() && !self.plugin_panel.is_busy());
-                                if ui.button("チャットに戻る").clicked() {self.git_open=false; self.github_open=false; self.tools_open=false;self.plugins_open=false;}
+                                if ui.button("チャットに戻る").clicked() {self.git_open=false; self.github_open=false; self.tools_open=false;self.plugins_open=false; self.library_open = false;}
                             });
                         });
                     } else if self.commands_open {
@@ -1549,9 +2417,9 @@ impl eframe::App for App {
                                 if let Some(output)=self.command_panel.ui(ui,self.pending.is_none() && !self.change_panel.is_busy() && !self.git_panel.is_busy() && !self.github_panel.is_busy() && !self.tool_panel.is_busy() && !self.plugin_panel.is_busy()) {
                                     let session=&mut self.sessions[self.active];
                                     if !session.draft.is_empty() {session.draft.push_str("\n\n");}
-                                    session.draft.push_str(&output);session.history_enabled=false;self.sessions_dirty=true;self.commands_open=false; self.git_open=false; self.github_open=false; self.tools_open=false;self.plugins_open=false;
+                                    session.draft.push_str(&output);session.history_enabled=false;self.sessions_dirty=true;self.commands_open=false; self.git_open=false; self.github_open=false; self.tools_open=false;self.plugins_open=false; self.library_open = false;
                                 }
-                                if ui.button("チャットに戻る").clicked() {self.commands_open=false; self.git_open=false; self.github_open=false; self.tools_open=false;self.plugins_open=false;}
+                                if ui.button("チャットに戻る").clicked() {self.commands_open=false; self.git_open=false; self.github_open=false; self.tools_open=false;self.plugins_open=false; self.library_open = false;}
                             });
                         });
                     } else if self.changes_open {
@@ -1560,7 +2428,7 @@ impl eframe::App for App {
                             egui::ScrollArea::vertical().show(ui, |ui| {
                                 self.change_panel.ui(ui,self.pending.is_none() && !self.command_panel.is_busy() && !self.git_panel.is_busy() && !self.github_panel.is_busy() && !self.tool_panel.is_busy() && !self.plugin_panel.is_busy());
                                 if let Some(error) = &self.preferences_error { ui.colored_label(ui.visuals().error_fg_color,error); }
-                                if ui.button("チャットに戻る").clicked() { self.changes_open = false; self.commands_open = false; self.git_open=false; self.github_open=false; self.tools_open=false;self.plugins_open=false; }
+                                if ui.button("チャットに戻る").clicked() { self.changes_open = false; self.commands_open = false; self.git_open=false; self.github_open=false; self.tools_open=false;self.plugins_open=false; self.library_open = false; }
                             });
                         });
                     } else if self.files_open {
@@ -1606,22 +2474,31 @@ impl eframe::App for App {
                             ui.label(
                                 RichText::new("コードやログを一緒に確認しましょう。")
                                     .size(14.0)
-                                    .color(MUTED),
+                                    .color(MUTED()),
                             );
                             ui.add_space(28.0);
                             self.composer(ui);
                         });
                     } else {
-                        let extra = if self.backend == Backend::Rules {
-                            0.0
-                        } else {
-                            40.0
-                        } + if self.sessions[self.active].notice.is_some() {
+                        let extra = if self.sessions[self.active].notice.is_some() {
                             80.0
                         } else {
                             0.0
                         };
                         let extra = extra + self.sessions[self.active].attachments.len() as f32 * 26.0;
+                        let session = &self.sessions[self.active];
+                        let extra = extra
+                            + if session.skills.is_empty()
+                                && session.connectors.is_empty()
+                                && !self.history_chip_shown()
+                                && !self.tools_chip_shown()
+                            {
+                                0.0
+                            } else {
+                                40.0
+                            }
+                            + if self.context_warning().is_some() { 36.0 } else { 0.0 }
+                            + if self.mentioned_files().is_empty() { 0.0 } else { 40.0 };
                         let composer_top =
                             (bounds.bottom() - 108.0 - extra).max(bounds.top() + 80.0);
                         let history = egui::Rect::from_min_max(
@@ -1648,6 +2525,20 @@ impl eframe::App for App {
     }
 }
 
+/// Inline diff of a proposal in an answer, or why it cannot be shown.
+type DiffPreview = Result<Vec<codebot_core::ChangePreview>, String>;
+
+/// Saved chats being read in the background, and when reading began.
+type StartupLoad = (
+    mpsc::Receiver<Result<Option<chat_storage::Archive>, String>>,
+    std::time::Instant,
+);
+
+fn load_archive(path: Option<PathBuf>) -> Result<Option<chat_storage::Archive>, String> {
+    path.ok_or_else(|| "チャット保存先を取得できません".to_owned())
+        .and_then(|path| chat_storage::load(&path))
+}
+
 #[derive(Clone, Copy)]
 enum Icon {
     Send,
@@ -1658,29 +2549,262 @@ enum Icon {
     Settings,
 }
 
+/// Material state layer: an on-color overlay for hover (8%) and press (12%).
+fn state_layer(ui: &egui::Ui, response: &egui::Response, radius: f32, color: Color32) {
+    if !response.enabled() {
+        return;
+    }
+    let opacity = if response.is_pointer_button_down_on() {
+        0.12
+    } else if response.hovered() {
+        0.08
+    } else {
+        return;
+    };
+    ui.painter()
+        .rect_filled(response.rect, radius, color.gamma_multiply(opacity));
+}
+
+/// Material focus indicator drawn just outside the component.
+fn focus_ring(ui: &egui::Ui, response: &egui::Response, radius: f32) {
+    if response.has_focus() {
+        ui.painter().rect_stroke(
+            response.rect.expand(2.0),
+            radius + 2.0,
+            egui::Stroke::new(2.0_f32, ACCENT()),
+            egui::StrokeKind::Outside,
+        );
+    }
+}
+
+/// Material filled text field padding (egui's default is 4×2).
+const FIELD_MARGIN: egui::Margin = egui::Margin::symmetric(14, 8);
+
+/// Single-line text field with Material padding.
+fn text_field(text: &mut dyn egui::TextBuffer) -> egui::TextEdit<'_> {
+    egui::TextEdit::singleline(text).margin(FIELD_MARGIN)
+}
+
+/// Multi-line text field with Material padding.
+fn text_area(text: &mut dyn egui::TextBuffer) -> egui::TextEdit<'_> {
+    egui::TextEdit::multiline(text).margin(FIELD_MARGIN)
+}
+
+fn history_chars(history: &[ChatMessage]) -> usize {
+    history.iter().map(|m| m.content.chars().count()).sum()
+}
+
+/// Drop the oldest user/answer pairs until the history fits in `allowed`
+/// characters. Returns the number of pairs removed.
+fn trim_history(history: &mut Vec<ChatMessage>, allowed: usize) -> usize {
+    let mut removed = 0;
+    while history.len() >= 2 && history_chars(history) > allowed {
+        history.drain(..2);
+        removed += 1;
+    }
+    removed
+}
+
+/// Add the chat's skill instructions in front of the first request message.
+/// The input limit is widened by the instructions' size; the total stays within
+/// `max_context_chars`.
+fn apply_skills(
+    session: &Session,
+    config: &Config,
+    messages: &mut [ChatMessage],
+) -> Result<(), String> {
+    let skills = library::resolve_skills(&session.skills, session.workspace_root.as_deref())?;
+    codebot_core::prepend_skills(config, messages, &skills)
+}
+
+/// Material input chip with a colored dot and a remove action.
+/// Material input chip with a colored dot; `removable` adds the drawn close mark.
+fn chip(
+    ui: &mut egui::Ui,
+    kind: &str,
+    name: &str,
+    color: Color32,
+    removable: bool,
+) -> egui::Response {
+    let mut label = egui::text::LayoutJob::default();
+    label.append(
+        &format!("{kind}: {name}"),
+        14.0,
+        egui::TextFormat::simple(egui::FontId::proportional(13.0), ON_SECONDARY_CONTAINER()),
+    );
+    // Room for the drawn close mark (the UI fonts have no ✕ glyph).
+    label.append(
+        " ",
+        if removable { 18.0 } else { 4.0 },
+        egui::TextFormat::simple(egui::FontId::proportional(13.0), MUTED()),
+    );
+    let response = ui.add(
+        egui::Button::new(label)
+            .fill(SURFACE())
+            .stroke(egui::Stroke::new(1.0_f32, BORDER()))
+            .corner_radius(8.0)
+            .min_size(egui::vec2(0.0, 30.0)),
+    );
+    ui.painter().circle_filled(
+        egui::pos2(response.rect.left() + 14.0, response.rect.center().y),
+        4.0,
+        color,
+    );
+    let mark = egui::pos2(response.rect.right() - 16.0, response.rect.center().y);
+    let stroke = egui::Stroke::new(1.5_f32, MUTED());
+    if removable {
+        for (a, b) in [((-3.5, -3.5), (3.5, 3.5)), ((-3.5, 3.5), (3.5, -3.5))] {
+            ui.painter().line_segment(
+                [mark + egui::vec2(a.0, a.1), mark + egui::vec2(b.0, b.1)],
+                stroke,
+            );
+        }
+    }
+
+    state_layer(ui, &response, 8.0, TEXT());
+    response.widget_info(|| {
+        egui::WidgetInfo::labeled(
+            egui::WidgetType::Button,
+            true,
+            format!("{kind}「{name}」を外す"),
+        )
+    });
+    response
+}
+
+/// Material search bar: a full-radius container with a leading search icon.
+fn search_bar(ui: &mut egui::Ui, query: &mut String) -> egui::Response {
+    egui::Frame::new()
+        .fill(SURFACE())
+        .corner_radius(SHAPE_FULL)
+        .inner_margin(egui::Margin {
+            left: 44,
+            right: 16,
+            top: 10,
+            bottom: 10,
+        })
+        .show(ui, |ui| {
+            let response = ui.add(
+                crate::text_field(query)
+                    .hint_text(RichText::new("チャットを検索").color(MUTED()))
+                    .frame(false)
+                    .margin(egui::Vec2::ZERO)
+                    .desired_width(f32::INFINITY),
+            );
+            let c = egui::pos2(response.rect.left() - 23.0, response.rect.center().y - 1.0);
+            let stroke = egui::Stroke::new(1.75_f32, MUTED());
+            ui.painter().circle_stroke(c, 5.0, stroke);
+            ui.painter()
+                .line_segment([c + egui::vec2(3.8, 3.8), c + egui::vec2(7.5, 7.5)], stroke);
+            response
+        })
+        .inner
+}
+
+/// Navigation drawer item with a pill-shaped secondary-container indicator.
+fn drawer_item(ui: &mut egui::Ui, text: &str, selected: bool) -> egui::Response {
+    let response = ui.add(
+        egui::Button::new(RichText::new(text).size(14.0).color(if selected {
+            ON_SECONDARY_CONTAINER()
+        } else {
+            MUTED()
+        }))
+        .truncate()
+        .min_size(egui::vec2(ui.available_width(), 44.0))
+        .shortcut_text("")
+        .corner_radius(SHAPE_FULL)
+        .stroke(egui::Stroke::NONE)
+        .fill(if selected {
+            SELECTED()
+        } else {
+            Color32::TRANSPARENT
+        }),
+    );
+    let radius = response.rect.height() / 2.0;
+    state_layer(ui, &response, radius, TEXT());
+    focus_ring(ui, &response, radius);
+    response
+}
+
+/// Header destination: a Material text button that becomes tonal while its page is open.
+fn tab_button(ui: &mut egui::Ui, text: &str, selected: bool) -> egui::Response {
+    // Tighter padding below the 900px breakpoint so the bar fits 700px windows.
+    let padding = if ui.ctx().screen_rect().width() < 900.0 {
+        8.0
+    } else {
+        16.0
+    };
+    let previous = std::mem::replace(&mut ui.spacing_mut().button_padding.x, padding);
+    let response = ui.add(
+        egui::Button::new(RichText::new(text).size(14.0).color(if selected {
+            ON_SECONDARY_CONTAINER()
+        } else {
+            ACCENT()
+        }))
+        .selected(selected)
+        .min_size(egui::vec2(0.0, 36.0))
+        .corner_radius(SHAPE_FULL)
+        .stroke(egui::Stroke::NONE)
+        .fill(if selected {
+            SELECTED()
+        } else {
+            Color32::TRANSPARENT
+        }),
+    );
+    ui.spacing_mut().button_padding.x = previous;
+    let radius = response.rect.height() / 2.0;
+    state_layer(
+        ui,
+        &response,
+        radius,
+        if selected { TEXT() } else { ACCENT() },
+    );
+    focus_ring(ui, &response, radius);
+    response
+}
+
+/// Extended FAB for starting a chat.
 fn new_chat_button(ui: &mut egui::Ui) -> egui::Response {
     let mut label = egui::text::LayoutJob::simple_singleline(
         "新しいチャット".into(),
-        egui::FontId::proportional(13.0),
-        TEXT,
+        egui::FontId::proportional(14.0),
+        ON_PRIMARY_CONTAINER(),
     );
     // Reserve room for the drawn icon while retaining the native button label.
-    label.sections[0].leading_space = 24.0;
+    label.sections[0].leading_space = 28.0;
+    // Reserve a slot below the button so its elevation shadow is painted underneath.
+    let shadow_slot = ui.painter().add(egui::Shape::Noop);
     let response = ui.add(
         egui::Button::new(label)
-            .min_size(egui::vec2(192.0, 38.0))
+            .min_size(egui::vec2(160.0, 52.0))
             .shortcut_text("")
-            .fill(RAISED),
+            .corner_radius(SHAPE_LARGE)
+            .stroke(egui::Stroke::NONE)
+            .fill(PRIMARY_CONTAINER()),
     );
-    let center = egui::pos2(response.rect.left() + 18.0, response.rect.center().y);
-    let stroke = egui::Stroke::new(1.5_f32, MUTED);
-    for offset in [egui::vec2(5.0, 0.0), egui::vec2(0.0, 5.0)] {
+    let level = if response.hovered() { 2.0 } else { 1.0 };
+    ui.painter().set(
+        shadow_slot,
+        egui::Shadow {
+            offset: [0, level as i8],
+            blur: (3.0 * level) as u8,
+            spread: 0,
+            color: Color32::from_black_alpha(46),
+        }
+        .as_shape(response.rect, SHAPE_LARGE),
+    );
+    state_layer(ui, &response, SHAPE_LARGE, ON_PRIMARY_CONTAINER());
+    focus_ring(ui, &response, SHAPE_LARGE);
+    let center = egui::pos2(response.rect.left() + 26.0, response.rect.center().y);
+    let stroke = egui::Stroke::new(2.0_f32, ON_PRIMARY_CONTAINER());
+    for offset in [egui::vec2(6.0, 0.0), egui::vec2(0.0, 6.0)] {
         ui.painter()
             .line_segment([center - offset, center + offset], stroke);
     }
     response
 }
 
+/// Material icon button: filled (primary) or standard, always circular.
 fn icon_button(
     ui: &mut egui::Ui,
     icon: Icon,
@@ -1688,34 +2812,41 @@ fn icon_button(
     enabled: bool,
     primary: bool,
 ) -> egui::Response {
-    let size = if primary { 36.0 } else { 30.0 };
+    let size = if primary { 40.0 } else { 36.0 };
     let response = ui.add_enabled(
         enabled,
         egui::Button::new("")
             .min_size(egui::vec2(size, size))
+            .stroke(egui::Stroke::NONE)
             .fill(if primary {
                 if enabled {
-                    ACCENT
+                    ACCENT()
                 } else {
-                    DISABLED
+                    DISABLED()
                 }
             } else {
                 Color32::TRANSPARENT
             })
-            .corner_radius(9.0),
+            .corner_radius(SHAPE_FULL),
     );
     response.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, enabled, name));
-    let p = ui.painter();
-    let c = response.rect.center();
+    let radius = response.rect.height() / 2.0;
     if primary && enabled && (response.hovered() || response.is_pointer_button_down_on()) {
-        p.rect_filled(response.rect, 9.0, ACCENT_HOVER);
+        ui.painter()
+            .circle_filled(response.rect.center(), radius, ACCENT_HOVER());
+    } else if !primary {
+        state_layer(ui, &response, radius, MUTED());
     }
     let color = if primary && enabled {
-        Color32::WHITE
+        ON_PRIMARY()
+    } else if enabled {
+        MUTED()
     } else {
-        MUTED
+        DISABLED_CONTENT()
     };
-    let stroke = egui::Stroke::new(1.5_f32, color);
+    let p = ui.painter();
+    let c = response.rect.center();
+    let stroke = egui::Stroke::new(1.75_f32, color);
     let line = |a: [f32; 2], b: [f32; 2]| {
         p.line_segment(
             [c + egui::vec2(a[0], a[1]), c + egui::vec2(b[0], b[1])],
@@ -1761,19 +2892,12 @@ fn icon_button(
         Icon::Settings => {
             for (x, y) in [(-5.0, -3.0), (0.0, 4.0), (5.0, -1.0)] {
                 line([x, -7.0], [x, 7.0]);
-                p.circle_filled(c + egui::vec2(x, y), 2.7, SURFACE);
+                p.circle_filled(c + egui::vec2(x, y), 2.7, SURFACE());
                 p.circle_stroke(c + egui::vec2(x, y), 2.2, stroke);
             }
         }
     }
-    if response.has_focus() {
-        p.rect_stroke(
-            response.rect,
-            9.0,
-            egui::Stroke::new(1.5_f32, ACCENT),
-            egui::StrokeKind::Inside,
-        );
-    }
+    focus_ring(ui, &response, radius);
     response
         .on_hover_text(name)
         .on_disabled_hover_text(if primary {
@@ -1793,43 +2917,7 @@ fn main() -> eframe::Result {
         },
         Box::new(|cc| {
             let app = App::load(&cc.egui_ctx);
-            cc.egui_ctx.set_theme(egui::Theme::Light);
-            let mut style = (*cc.egui_ctx.style()).clone();
-            style.visuals = egui::Visuals::light();
-            style.visuals.override_text_color = Some(TEXT);
-            style.visuals.panel_fill = SHELL;
-            style.visuals.extreme_bg_color = RAISED;
-            style.visuals.window_fill = SURFACE;
-            style.visuals.selection.bg_fill = SELECTED;
-            style.visuals.selection.stroke = egui::Stroke::new(1.0_f32, TEXT);
-            style.visuals.widgets.noninteractive.bg_stroke = egui::Stroke::NONE;
-            style.visuals.widgets.inactive.fg_stroke.color = ACCENT;
-            style.visuals.widgets.hovered.fg_stroke.color = ACCENT;
-            style.visuals.widgets.active.fg_stroke.color = ACCENT;
-            style.visuals.widgets.inactive.weak_bg_fill = RAISED;
-            style.visuals.widgets.inactive.bg_stroke = egui::Stroke::NONE;
-            style.visuals.widgets.hovered.weak_bg_fill = SELECTED;
-            style.visuals.widgets.hovered.bg_stroke = egui::Stroke::new(1.0_f32, ACCENT);
-            style.visuals.widgets.active.bg_stroke = egui::Stroke::new(1.0_f32, ACCENT);
-            for widget in [
-                &mut style.visuals.widgets.inactive,
-                &mut style.visuals.widgets.hovered,
-                &mut style.visuals.widgets.active,
-            ] {
-                widget.corner_radius = egui::CornerRadius::same(7);
-            }
-            style.spacing.button_padding = egui::vec2(12.0, 7.0);
-            style.spacing.item_spacing = egui::vec2(10.0, 6.0);
-            style
-                .text_styles
-                .insert(egui::TextStyle::Body, egui::FontId::proportional(15.0));
-            style
-                .text_styles
-                .insert(egui::TextStyle::Button, egui::FontId::proportional(13.0));
-            style
-                .text_styles
-                .insert(egui::TextStyle::Monospace, egui::FontId::monospace(14.0));
-            cc.egui_ctx.set_style(style);
+            theme::apply(&cc.egui_ctx, theme::wants_dark(&cc.egui_ctx, app.theme));
             Ok(Box::new(app))
         }),
     )
@@ -1838,6 +2926,228 @@ fn main() -> eframe::Result {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn trimming_removes_whole_oldest_pairs_until_the_history_fits() {
+        let mut history = vec![
+            ChatMessage::user("a".repeat(40)),
+            ChatMessage::assistant("b".repeat(40)),
+            ChatMessage::user("c".repeat(10)),
+            ChatMessage::assistant("d".repeat(10)),
+        ];
+        assert_eq!(trim_history(&mut history, 50), 1);
+        assert_eq!(history.len(), 2);
+        assert_eq!(history[0].content, "c".repeat(10));
+        assert_eq!(trim_history(&mut history, 50), 0);
+        assert_eq!(trim_history(&mut history, 0), 1);
+        assert!(history.is_empty());
+    }
+    #[test]
+    fn the_near_limit_warning_follows_the_configured_budget() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = dir.path().join("config.toml");
+        std::fs::write(&config, "provider = \"openai\"\nmax_context_chars = 100\n").unwrap();
+        let mut app = App::default();
+        app.config_path = config.to_string_lossy().into_owned();
+        app.backend = Backend::Openai;
+        app.sessions[0].draft = "x".repeat(70);
+        assert!(app.context_warning().is_none());
+        app.sessions[0].draft = "x".repeat(85);
+        assert_eq!(app.context_warning(), Some((85, 100)));
+        app.backend = Backend::Rules;
+        assert!(app.context_warning().is_none());
+    }
+    /// Serve one canned JSON response per connection on a local port.
+    fn mock_api(
+        responses: Vec<serde_json::Value>,
+    ) -> (String, std::thread::JoinHandle<Vec<serde_json::Value>>) {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/v1", listener.local_addr().unwrap());
+        let join = std::thread::spawn(move || {
+            let mut requests = Vec::new();
+            for response in responses {
+                let (mut socket, _) = listener.accept().unwrap();
+                let mut raw = Vec::new();
+                let mut byte = [0];
+                while !raw.ends_with(b"\r\n\r\n") {
+                    socket.read_exact(&mut byte).unwrap();
+                    raw.push(byte[0]);
+                }
+                let header = String::from_utf8(raw).unwrap().to_lowercase();
+                let size: usize = header
+                    .lines()
+                    .find_map(|l| {
+                        l.strip_prefix("content-length:")
+                            .map(|v| v.trim().parse().unwrap())
+                    })
+                    .unwrap();
+                let mut body = vec![0; size];
+                socket.read_exact(&mut body).unwrap();
+                requests.push(serde_json::from_slice(&body).unwrap());
+                let bytes = serde_json::to_vec(&response).unwrap();
+                write!(socket, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", bytes.len()).unwrap();
+                socket.write_all(&bytes).unwrap();
+            }
+            requests
+        });
+        (url, join)
+    }
+    #[test]
+    fn chat_with_tools_runs_through_the_tool_engine_and_records_the_answer() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = dir.path().join("config.toml");
+        std::fs::write(&config, "provider = \"rules\"\n").unwrap();
+        let (url, server) = mock_api(vec![serde_json::json!({
+            "choices": [{"finish_reason": "stop", "message": {"content": "ツールは不要でした。"}}]
+        })]);
+        let mut app = App::default();
+        app.config_path = config.to_string_lossy().into_owned();
+        app.backend = Backend::Custom;
+        app.api_configs.insert(
+            Backend::Custom,
+            ApiConfig {
+                base_url: url,
+                model: "mock".into(),
+                anonymous: true,
+                ..Default::default()
+            },
+        );
+        app.sessions[0].use_tools = true;
+        app.sessions[0].draft = "READMEを直して".into();
+        let ctx = egui::Context::default();
+
+        // Without a workspace the draft is kept and nothing is sent.
+        app.send(&ctx);
+        assert!(app.chat_tool.is_none());
+        assert_eq!(app.sessions[0].draft, "READMEを直して");
+        assert!(app.sessions[0]
+            .notice
+            .as_deref()
+            .unwrap()
+            .contains("作業フォルダ"));
+
+        app.sessions[0].workspace_root = Some(dir.path().to_string_lossy().into_owned());
+        app.send(&ctx);
+        assert!(app.chat_tool.is_some());
+        assert!(app.sessions[0].draft.is_empty());
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while app.chat_tool.is_some() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "tool conversation did not finish"
+            );
+            let _ = app.poll_chat_tool(&ctx);
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let session = &app.sessions[0];
+        assert_eq!(
+            session.messages.last().unwrap(),
+            &(false, "ツールは不要でした。".to_owned())
+        );
+        assert_eq!(session.history.len(), 2);
+        assert_eq!(session.history[0].content, "READMEを直して");
+        let requests = server.join().unwrap();
+        assert_eq!(requests[0]["tools"].as_array().unwrap().len(), 2);
+    }
+    fn wait_for_restore(app: &mut App) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while app.poll_restore() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "startup load did not finish"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+    }
+    #[test]
+    fn startup_restore_runs_in_the_background_and_never_overwrites_the_archive_early() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("chats.json");
+        let saved = Session {
+            label: "saved chat".into(),
+            messages: vec![(true, "question".into()), (false, "answer".into())],
+            ..Default::default()
+        };
+        chat_storage::save(&path, &[saved], 0).unwrap();
+        let original = std::fs::read(&path).unwrap();
+
+        let mut app = App::default();
+        app.save_chats = true;
+        app.archive_path_override = path.to_string_lossy().into_owned();
+        app.start_restore(&egui::Context::default());
+        // Until the result is applied, edits to the startup session are not saved.
+        app.sessions[0].draft = "typed during loading".into();
+        app.sessions_dirty = true;
+        app.flush_chats();
+        assert_eq!(std::fs::read(&path).unwrap(), original);
+
+        wait_for_restore(&mut app);
+        assert_eq!(app.sessions.len(), 1);
+        assert_eq!(app.sessions[0].label, "saved chat");
+        assert!(!app.archive_blocked);
+        assert!(app.storage_error.is_none());
+        assert!(app.startup_load.is_none());
+    }
+    #[test]
+    fn a_broken_archive_found_at_startup_is_reported_and_kept() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("chats.json");
+        std::fs::write(&path, "not json").unwrap();
+        let mut app = App::default();
+        app.save_chats = true;
+        app.archive_path_override = path.to_string_lossy().into_owned();
+        app.start_restore(&egui::Context::default());
+        wait_for_restore(&mut app);
+        assert!(app.archive_blocked);
+        assert!(app.storage_error.is_some());
+        app.sessions_dirty = true;
+        app.flush_chats();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "not json");
+        // A fast load shows no loading state, so there is nothing to cross-fade.
+        assert!(app.reveal.is_none());
+    }
+    #[test]
+    fn skills_are_added_to_the_request_copy_only_and_missing_skills_block_sending() {
+        let dir = tempfile::tempdir().unwrap();
+        let skill_dir = dir.path().join(".claude/skills/demo-skill");
+        std::fs::create_dir_all(&skill_dir).unwrap();
+        std::fs::write(
+            skill_dir.join("SKILL.md"),
+            "---\nname: demo-skill\ndescription: demo\n---\nAlways answer in bullet points.",
+        )
+        .unwrap();
+        let session = Session {
+            skills: vec!["demo-skill".into()],
+            workspace_root: Some(dir.path().to_string_lossy().into_owned()),
+            ..Default::default()
+        };
+        let config = Config {
+            max_input_chars: 10,
+            ..Default::default()
+        };
+        let mut messages = vec![ChatMessage::user("hi")];
+        apply_skills(&session, &config, &mut messages).unwrap();
+        assert!(messages[0]
+            .content
+            .contains("Always answer in bullet points."));
+        assert!(messages[0].content.ends_with("--- 利用者の依頼 ---\nhi"));
+
+        let small = Config {
+            max_context_chars: 20,
+            ..Default::default()
+        };
+        let mut messages = vec![ChatMessage::user("hi")];
+        assert!(apply_skills(&session, &small, &mut messages).is_err());
+
+        let missing = Session {
+            skills: vec!["not-installed".into()],
+            ..Default::default()
+        };
+        let mut messages = vec![ChatMessage::user("hi")];
+        assert!(apply_skills(&missing, &config, &mut messages)
+            .unwrap_err()
+            .contains("not-installed"));
+    }
     #[test]
     fn restoring_an_interrupted_generation_marks_partial_text_and_keeps_it_out_of_history() {
         let dir = tempfile::tempdir().unwrap();

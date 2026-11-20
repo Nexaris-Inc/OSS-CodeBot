@@ -2,6 +2,7 @@
 //! executes a model-proposed command or applies a model-proposed file change.
 use crate::{
     ApiConfig, ApiProtocol, ApiProvider, Backend, ChangeProposal, ChatMessage, CommandSpec, Config,
+    ConnectorTool,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -139,6 +140,27 @@ pub struct ToolConversation {
     requests: usize,
     finished: bool,
     max_chars: usize,
+    connector_tools: Vec<(String, ConnectorTool)>,
+}
+/// Connector tools that can be offered to the model, with their exposed names.
+/// Tools whose name cannot be expressed or would collide are left out.
+pub fn offered_connector_tools(tools: &[ConnectorTool]) -> Vec<(String, ConnectorTool)> {
+    let mut offered: Vec<(String, ConnectorTool)> = Vec::new();
+    for tool in tools {
+        if let Some(name) = tool.exposed_name() {
+            if !offered.iter().any(|(n, _)| *n == name) && offered.len() < 64 {
+                offered.push((name, tool.clone()));
+            }
+        }
+    }
+    offered
+}
+/// Characters the tool definitions add to a request (built-in plus connector tools).
+pub fn tool_definitions_chars(protocol: ApiProtocol, tools: &[ConnectorTool]) -> usize {
+    definitions(protocol, &offered_connector_tools(tools))
+        .to_string()
+        .chars()
+        .count()
 }
 impl ToolConversation {
     pub fn new(
@@ -149,11 +171,25 @@ impl ToolConversation {
         messages: &[ChatMessage],
         root: &Path,
     ) -> Result<Self, String> {
+        Self::with_connectors(config, backend, api, key, messages, root, &[])
+    }
+    /// Like [`Self::new`], additionally offering the given connector tools. Calls
+    /// to them are returned as requests; nothing is executed here.
+    pub fn with_connectors(
+        config: &Config,
+        backend: Backend,
+        api: &ApiConfig,
+        key: Option<&str>,
+        messages: &[ChatMessage],
+        root: &Path,
+        tools: &[ConnectorTool],
+    ) -> Result<Self, String> {
         crate::validate_messages(config, messages)?;
         let root = crate::Workspace::open(root)?.root().to_path_buf();
         let provider = ApiProvider::new(backend, api, key)?;
         let (_, _, mut body) = provider.request_messages(messages)?;
-        body["tools"] = definitions(provider.config.protocol);
+        let connector_tools = offered_connector_tools(tools);
+        body["tools"] = definitions(provider.config.protocol, &connector_tools);
         // Keep each proposal independent and individually reviewable.
         if matches!(provider.config.protocol, ApiProtocol::Responses) {
             body["parallel_tool_calls"] = json!(false);
@@ -170,7 +206,47 @@ impl ToolConversation {
             requests: 0,
             finished: false,
             max_chars: config.max_context_chars,
+            connector_tools,
         })
+    }
+    /// Characters of the next request body (history, tools and results).
+    pub fn request_chars(&self) -> usize {
+        self.body.to_string().chars().count()
+    }
+    /// Protocol of this conversation's destination.
+    pub fn protocol(&self) -> ApiProtocol {
+        self.provider.config.protocol
+    }
+    /// Connector tools offered in this conversation.
+    pub fn connector_tools(&self) -> Vec<ConnectorTool> {
+        self.connector_tools
+            .iter()
+            .map(|(_, t)| t.clone())
+            .collect()
+    }
+    /// Number of connector tools offered in this conversation.
+    pub fn connector_tool_count(&self) -> usize {
+        self.connector_tools.len()
+    }
+    /// If the call targets a connector tool, validate it and return the tool and
+    /// its arguments. `None` means the call is for a built-in tool.
+    pub fn connector_call(
+        &self,
+        call: &ToolCall,
+    ) -> Option<Result<(ConnectorTool, Value), String>> {
+        let (_, tool) = self
+            .connector_tools
+            .iter()
+            .find(|(name, _)| *name == call.name)?;
+        Some(
+            if !call.arguments.is_object()
+                || serde_json::to_vec(&call.arguments).map_or(true, |v| v.len() > 64 * 1024)
+            {
+                Err("コネクターツールの引数はJSONオブジェクト（64 KiB以内）にしてください".into())
+            } else {
+                Ok((tool.clone(), call.arguments.clone()))
+            },
+        )
     }
     pub fn root(&self) -> &Path {
         &self.root
@@ -250,7 +326,14 @@ impl ToolConversation {
                     "ツール要求は1回の相談につき4件までです。新しく相談してください".into(),
                 );
             }
-            call.action(&self.root)?;
+            match self.connector_call(&call) {
+                Some(result) => {
+                    result?;
+                }
+                None => {
+                    call.action(&self.root)?;
+                }
+            }
             let fingerprint = format!(
                 "{:x}",
                 Sha256::digest(serde_json::to_vec(&json!([call.name, call.arguments])).unwrap())
@@ -457,11 +540,27 @@ fn string(value: &Value, max: usize) -> Result<String, String> {
         .map(str::to_owned)
         .ok_or("ツールの識別子・名前が不正です".into())
 }
-fn definitions(protocol: ApiProtocol) -> Value {
-    let definitions=[
+fn definitions(protocol: ApiProtocol, connector_tools: &[(String, ConnectorTool)]) -> Value {
+    let mut definitions=vec![
         ("codebot_propose_changes","Propose file changes for user review. This does not apply changes. Use version 1 changes with operation create/replace/delete. Replace and delete require the attached file's whole-file SHA-256. Paths are relative to the selected workspace.",json!({"type":"object","properties":{"proposal":{"type":"object","properties":{"version":{"type":"integer","enum":[1]},"changes":{"type":"array","items":{"type":"object","properties":{"operation":{"type":"string","enum":["create","replace","delete"]},"path":{"type":"string"},"content":{"type":"string"},"expected_sha256":{"type":"string"},"edits":{"type":"array","items":{"type":"object","properties":{"first_line":{"type":"integer"},"last_line":{"type":"integer"},"content":{"type":"string"}},"required":["first_line","last_line","content"]}}},"required":["operation","path"]}}},"required":["version","changes"]}},"required":["proposal"]})),
         ("codebot_run_command","Propose one executable and literal argv for user review. No implicit shell. The user-selected workspace is fixed; extra environment variables cannot be requested. Maximum timeout 300 seconds.",json!({"type":"object","properties":{"program":{"type":"string"},"args":{"type":"array","items":{"type":"string"}},"timeout_seconds":{"type":"integer","minimum":1,"maximum":300}},"required":["program","args","timeout_seconds"]})),
     ];
+    let descriptions: Vec<String> = connector_tools
+        .iter()
+        .map(|(_, tool)| {
+            format!(
+                "Connector \"{}\" tool \"{}\". The user reviews and confirms every call before it runs. {}",
+                tool.connector, tool.name, tool.description
+            )
+        })
+        .collect();
+    for ((name, tool), description) in connector_tools.iter().zip(&descriptions) {
+        definitions.push((
+            name.as_str(),
+            description.as_str(),
+            tool.input_schema.clone(),
+        ));
+    }
     let tools=definitions.into_iter().map(|(name,description,parameters)|match protocol {
         ApiProtocol::Openai=>json!({"type":"function","function":{"name":name,"description":description,"parameters":parameters}}),
         ApiProtocol::Responses=>json!({"type":"function","name":name,"description":description,"parameters":parameters}),
@@ -485,6 +584,66 @@ mod tests {
         thread,
         time::Instant,
     };
+    #[test]
+    fn connector_tools_are_offered_and_returned_as_requests_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let tool = ConnectorTool {
+            connector: "docs".into(),
+            name: "search.pages".into(),
+            description: "Search pages".into(),
+            input_schema: json!({"type":"object","properties":{"q":{"type":"string"}}}),
+        };
+        let use_tool = |id: &str, input: Value| json!({"type":"message","stop_reason":"tool_use","content":[{"type":"tool_use","id":id,"name":"mcp__docs__search_pages","input":input}]});
+        let (api, requests, join) = fixture(
+            ApiProtocol::Claude,
+            vec![
+                (200, use_tool("c1", json!({"q":"rust"}))),
+                (200, use_tool("c2", json!(["not-object"]))),
+            ],
+        );
+        let make = || {
+            ToolConversation::with_connectors(
+                &Config::default(),
+                Backend::Custom,
+                &api,
+                None,
+                &[ChatMessage::user("調べて")],
+                dir.path(),
+                &[tool.clone(), tool.clone()],
+            )
+            .unwrap()
+        };
+        let mut conversation = make();
+        assert_eq!(conversation.connector_tool_count(), 1);
+        let cancel = AtomicBool::new(false);
+        let reply = conversation.request(&cancel).unwrap();
+        let call = reply.call().unwrap();
+        let (found, arguments) = conversation.connector_call(call).unwrap().unwrap();
+        assert_eq!(found.name, "search.pages");
+        assert_eq!(arguments, json!({"q":"rust"}));
+        let sent = requests.lock().unwrap()[0].clone();
+        let names: Vec<_> = sent["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|t| t["name"].as_str().unwrap().to_owned())
+            .collect();
+        assert_eq!(
+            names,
+            [
+                "codebot_propose_changes",
+                "codebot_run_command",
+                "mcp__docs__search_pages"
+            ]
+        );
+        assert!(
+            tool_definitions_chars(ApiProtocol::Claude, &[tool.clone()])
+                > tool_definitions_chars(ApiProtocol::Claude, &[])
+        );
+        let mut invalid = make();
+        assert!(invalid.request(&cancel).is_err());
+        join.join().unwrap();
+    }
     #[test]
     fn cancellation_during_pending_headers_closes_the_request_without_a_proposal() {
         let dir = tempfile::tempdir().unwrap();

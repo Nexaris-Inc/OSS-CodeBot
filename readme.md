@@ -38,7 +38,7 @@ WindowsはユーザーのAppData、macOSはApplication Support、LinuxはXDG_CON
 - セッション一覧、診断履歴、結果コピー、Ctrl / ⌘ + Enterで診断
 - 会話中心のGUI、折りたたみ可能なサイドバー、チャット別の下書き、画面内設定
 - 回答のMarkdown表示（見出し・リスト・表・引用・リンク）、言語別のコードハイライト、コードブロック単位のコピー
-- デフォルトは白基調。送信ボタンは青地に白い矢印、選択状態は淡い青で表示
+- Material Design 3に沿った白基調の配色。送信ボタンは青地に白い矢印、選択状態は淡い青で表示
 - 狭いウィンドウではチャット切替メニューを使用。入力例はありません。
 - 会話履歴の送信はGUIで選択可能。送信先変更時には再確認し、ルール診断は常に今回の入力だけを処理します。
 - CLIの`--interactive`で継続対話。`/clear`・`/trim`で送信履歴を減らせます。
@@ -54,6 +54,8 @@ WindowsはユーザーのAppData、macOSはApplication Support、LinuxはXDG_CON
 - 確認付きコマンド実行、標準出力・標準エラーの逐次表示、タイムアウト・停止・子プロセス終了、結果の下書き追加。[使い方](docs/COMMANDS.md)
 - Gitの状態・差分・ブランチ、選択ステージ/解除、コミット文の提案と確認付きコミット・push。[使い方](docs/GIT.md)
 - GitHubのIssue/PR一覧・本文・差分、チャットへの取り込み、Issueからのブランチ準備、確認付きIssue/PR作成・コメントと重複投稿防止。[使い方](docs/GITHUB.md)
+- チャットでの確認付きツール利用（変更案・コマンド・コネクター）、作業フォルダの全文検索と入力中のパスからのファイル候補、回答内の変更案の差分表示、コンテキスト上限が近いときの履歴整理、ダークテーマ。[使い方](docs/SKILLS_CONNECTORS.md)・[参照ファイル](docs/WORKSPACES.md)
+- スキル（Claude Code互換の`SKILL.md`）のライブラリと取り込み、チャットごとの追加。CLIの`--skill`・`--connector`・`--list-skills`。ローカルMCPサーバーをコネクターとして登録し、「AIに作業を相談」で呼び出しごとに確認して実行。送信内容の内訳を示すコンテキストのセグメントバー。[使い方](docs/SKILLS_CONNECTORS.md)
 - 標準エラーへの処理完了／エラーログ（入力内容は記録しません）
 
 OpenAI・Gemini・Claude・DeepSeek・Qwen・GLM・Grok・MiMo・KimiとカスタムAPIに対応しています。設定画面で処理方式・モデルID・APIキー・接続先を指定してください。APIキーは保存せず、環境変数からも取得できます。詳しくは [API設定](docs/API.md) を参照してください。

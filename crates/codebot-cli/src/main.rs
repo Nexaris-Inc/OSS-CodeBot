@@ -26,6 +26,15 @@ struct Args {
     tools: bool,
     #[arg(long, requires = "tools")]
     tools_journal_dir: Option<PathBuf>,
+    /// Add a skill's instructions (SKILL.md) before the request. Repeat; see --list-skills.
+    #[arg(long = "skill", value_name = "NAME")]
+    skills: Vec<String>,
+    /// Offer a connector's tools from [[connectors]] in the config. Repeat; needs --tools.
+    #[arg(long = "connector", value_name = "NAME", requires = "tools")]
+    connectors: Vec<String>,
+    /// List the skills and connectors that --skill and --connector can use.
+    #[arg(long, conflicts_with_all = ["input", "interactive", "tools", "stream", "preview"])]
+    list_skills: bool,
     #[command(flatten)]
     cache: cache_cli::Args,
     /// Input text; reads stdin when omitted
@@ -185,6 +194,10 @@ fn run() -> Result<(), String> {
         return Err("--yesは変更の適用・取り消し、API接続確認時だけ指定できます".into());
     }
     let c = Config::load(args.config.as_deref())?;
+    if args.list_skills {
+        return list_skills(&c, args.workspace.as_deref());
+    }
+    let skills = codebot_core::resolve_skills(&args.skills, args.workspace.as_deref())?;
     if args.list_models || args.test_api {
         let backend = Backend::from_id(&c.provider).ok_or("対応していないプロバイダーです")?;
         if args.list_models {
@@ -230,7 +243,7 @@ fn run() -> Result<(), String> {
             .map_err(|_| "Ctrl+Cの処理を準備できません")?;
     }
     if args.interactive {
-        return interactive(&c, args.stream, &cancel);
+        return interactive(&c, args.stream, &cancel, &skills);
     }
     let input = match args.input {
         Some(s) => s,
@@ -275,14 +288,28 @@ fn run() -> Result<(), String> {
         );
     }
     let input = codebot_core::compose_input(&input, &attachments)?;
+    let mut messages = vec![ChatMessage::user(input.clone())];
+    if !skills.is_empty() {
+        if backend == Backend::Rules {
+            eprintln!("ローカル診断ではスキルを使いません");
+        } else {
+            codebot_core::prepend_skills(&c, &mut messages, &skills)?;
+            for skill in &skills {
+                eprintln!("スキル: {}（{}）", skill.name, skill.source.label());
+            }
+        }
+    }
     if args.preview {
-        println!("{input}");
+        println!("{}", messages[0].content);
         return Ok(());
     }
     if args.stream {
-        if stream_answer(&c, backend, &[ChatMessage::user(input)], &cancel)?.is_none() {
+        if stream_answer(&c, backend, &messages, &cancel)?.is_none() {
             return Ok(());
         }
+    } else if backend != Backend::Rules && !skills.is_empty() {
+        let output = execute_messages(&c, backend, &c.api, None, &messages)?;
+        println!("{output}");
     } else {
         let output = execute_backend(&c, backend, &c.api, None, &input)?;
         println!("{output}");
@@ -571,7 +598,45 @@ fn stream_answer(
         codebot_core::StreamEnd::Failed(error) => Err(error),
     }
 }
-fn interactive(config: &Config, streaming: bool, cancel: &AtomicBool) -> Result<(), String> {
+fn list_skills(config: &Config, workspace: Option<&std::path::Path>) -> Result<(), String> {
+    let library = codebot_core::default_skills_dir();
+    let sources = codebot_core::skill_sources(library.as_deref(), workspace);
+    let (skills, problems) = codebot_core::list_skills(&sources);
+    println!("スキル（--skill NAME）:");
+    if skills.is_empty() {
+        println!("  なし");
+    }
+    for skill in &skills {
+        println!(
+            "  {}  [{}]  {}",
+            skill.name,
+            skill.source.label(),
+            skill.description
+        );
+    }
+    for (path, error) in &problems {
+        eprintln!("読み込めないスキル: {}: {error}", path.display());
+    }
+    println!("コネクター（--tools --connector NAME。設定ファイルの [[connectors]]）:");
+    if config.connectors.is_empty() {
+        println!("  なし");
+    }
+    for connector in &config.connectors {
+        println!(
+            "  {}  {} {}",
+            connector.name,
+            connector.command,
+            connector.args.join(" ")
+        );
+    }
+    Ok(())
+}
+fn interactive(
+    config: &Config,
+    streaming: bool,
+    cancel: &AtomicBool,
+    skills: &[codebot_core::Skill],
+) -> Result<(), String> {
     let backend = Backend::from_id(&config.provider).ok_or("対応していないプロバイダーです")?;
     eprintln!("対話モード: 各入力と会話履歴を選択した処理先へ送ります。/clear: 履歴消去、/trim: 最古の1往復を削除、/quit: 終了。文字数予算: {}（モデルのトークン上限とは別）", config.max_context_chars);
     let mut history = Vec::new();
@@ -631,10 +696,18 @@ fn interactive(config: &Config, streaming: bool, cancel: &AtomicBool) -> Result<
         }
         let mut messages = history.clone();
         messages.push(ChatMessage::user(input));
+        // Skill instructions go into this request only, never into the history.
+        let mut request = messages.clone();
+        if backend != Backend::Rules {
+            if let Err(error) = codebot_core::prepend_skills(config, &mut request, skills) {
+                eprintln!("ERROR {error}");
+                continue;
+            }
+        }
         let answer = if streaming {
-            stream_answer(config, backend, &messages, cancel)
+            stream_answer(config, backend, &request, cancel)
         } else {
-            execute_messages(config, backend, &config.api, None, &messages).map(Some)
+            execute_messages(config, backend, &config.api, None, &request).map(Some)
         };
         match answer {
             Ok(Some(answer)) => {

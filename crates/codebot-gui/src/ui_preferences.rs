@@ -25,6 +25,9 @@ pub struct UiPreferences {
     pub last_change_root: String,
     pub last_change_journal: String,
     pub github: GithubConfig,
+    pub connectors: Vec<codebot_core::ConnectorConfig>,
+    pub reduce_motion: bool,
+    pub theme: crate::theme::ThemeChoice,
 }
 
 impl UiPreferences {
@@ -44,6 +47,9 @@ impl UiPreferences {
         codebot_core::GithubClient::new(&github, Some("configuration-validation"))
             .map_err(|e| e.to_string())?;
         self.local.validate_source()?;
+        for connector in &self.connectors {
+            connector.validate()?;
+        }
         for config in self.api_configs.values() {
             if !config.base_url.is_empty() {
                 config.validate_url()?;

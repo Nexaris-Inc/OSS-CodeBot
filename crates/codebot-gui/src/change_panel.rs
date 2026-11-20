@@ -175,7 +175,7 @@ impl ChangePanel {
             ui.label("作業フォルダのフルパス");
             if ui
                 .add(
-                    egui::TextEdit::singleline(&mut self.root)
+                    crate::text_field(&mut self.root)
                         .interactive(!self.root_locked)
                         .desired_width(f32::INFINITY),
                 )
@@ -190,7 +190,7 @@ impl ChangePanel {
                     ui.label("修正提案の回答を貼り付けるか、回答の「変更案を確認」から開きます。");
                     if ui
                         .add(
-                            egui::TextEdit::multiline(&mut self.text)
+                            crate::text_area(&mut self.text)
                                 .desired_width(f32::INFINITY)
                                 .desired_rows(5)
                                 .char_limit(1024 * 1024),
@@ -246,7 +246,7 @@ impl ChangePanel {
             if ui
                 .add_enabled(
                     self.task.is_none(),
-                    egui::TextEdit::singleline(&mut self.journal).desired_width(f32::INFINITY),
+                    crate::text_field(&mut self.journal).desired_width(f32::INFINITY),
                 )
                 .changed()
             {
@@ -384,19 +384,19 @@ mod tests {
     }
 }
 
-fn diff_job(text: &str) -> egui::text::LayoutJob {
+pub(crate) fn diff_job(text: &str) -> egui::text::LayoutJob {
     let mut job = egui::text::LayoutJob::default();
     for line in text.split_inclusive('\n') {
         let color = if line.starts_with("--- ") || line.starts_with("+++ ") {
-            crate::MUTED
+            crate::MUTED()
         } else if line.starts_with('+') {
-            egui::Color32::from_rgb(22, 113, 61)
+            crate::DIFF_ADD()
         } else if line.starts_with('-') {
-            egui::Color32::from_rgb(180, 35, 24)
+            crate::DIFF_DEL()
         } else if line.starts_with("@@") {
-            crate::ACCENT
+            crate::ACCENT()
         } else {
-            crate::TEXT
+            crate::TEXT()
         };
         job.append(
             line,

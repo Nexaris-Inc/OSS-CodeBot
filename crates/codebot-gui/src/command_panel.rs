@@ -257,14 +257,14 @@ impl CommandPanel {
             ui.label("作業フォルダのフルパス");
             changed |= ui
                 .add(
-                    egui::TextEdit::singleline(&mut self.root)
+                    crate::text_field(&mut self.root)
                         .interactive(!self.root_locked)
                         .desired_width(f32::INFINITY),
                 )
                 .changed();
             ui.label("実行ファイル（フルパスまたはPATHの名前）");
             changed |= ui
-                .add(egui::TextEdit::singleline(&mut self.program).desired_width(f32::INFINITY))
+                .add(crate::text_field(&mut self.program).desired_width(f32::INFINITY))
                 .changed();
             ui.label("引数（1欄が1つの引数。シェル展開は行いません）");
             let mut remove = None;
@@ -272,7 +272,7 @@ impl CommandPanel {
                 ui.horizontal(|ui| {
                     changed |= ui
                         .add(
-                            egui::TextEdit::singleline(arg)
+                            crate::text_field(arg)
                                 .desired_width((ui.available_width() - 70.0).max(80.0)),
                         )
                         .changed();
@@ -292,10 +292,7 @@ impl CommandPanel {
             ui.collapsing("環境変数と実行上限", |ui| {
                 ui.label("追加で引き継ぐ環境変数名（カンマ区切り。値は保存・表示しません）");
                 changed |= ui
-                    .add(
-                        egui::TextEdit::singleline(&mut self.environment)
-                            .desired_width(f32::INFINITY),
-                    )
+                    .add(crate::text_field(&mut self.environment).desired_width(f32::INFINITY))
                     .changed();
                 ui.horizontal(|ui| {
                     ui.label("タイムアウト（秒）");

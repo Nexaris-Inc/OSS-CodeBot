@@ -1,14 +1,26 @@
 use serde::Deserialize;
 mod ai_tools;
+mod connectors;
 mod plugins;
+pub use connectors::{
+    call_connector_tool, list_connector_tools, ConnectorConfig, ConnectorOutput, ConnectorTool,
+    MAX_ATTACHED_CONNECTORS, MAX_CONNECTOR_RESULT_CHARS,
+};
+mod skills;
 pub use plugins::{
     default_plugins_dir, install_plugin, list_plugins, prepare_plugin_install,
     prepare_plugin_remove, remove_plugin, run_plugin, set_plugin_enabled, PluginEntry,
     PluginManifest, PluginPermission, PluginRun, PreparedPluginInstall, PreparedPluginRemove,
 };
+pub use skills::{
+    default_skills_dir, import_skill, list_skills, parse_skill, prepend_skills, read_skill,
+    remove_skill, resolve_skills, skill_preamble, skill_sources, user_skills_dir, Skill,
+    SkillSource, MAX_ATTACHED_SKILLS, MAX_SKILL_BODY_CHARS,
+};
 mod api;
 pub use ai_tools::{
-    AgentEvent, AgentReply, ToolAction, ToolCall, ToolConversation, ToolResult, ToolStatus,
+    offered_connector_tools, tool_definitions_chars, AgentEvent, AgentReply, ToolAction, ToolCall,
+    ToolConversation, ToolResult, ToolStatus,
 };
 mod api_diagnostics;
 pub use api_diagnostics::{
@@ -59,7 +71,9 @@ use std::{
     fs,
     path::{Path, PathBuf},
 };
-pub use workspace::{citation_location, compose_input, AnalysisAction, Attachment, Workspace};
+pub use workspace::{
+    citation_location, compose_input, AnalysisAction, Attachment, PathMention, SearchHit, Workspace,
+};
 
 #[derive(Clone, Debug, Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -69,6 +83,8 @@ pub struct Config {
     pub max_context_chars: usize,
     pub api: ApiConfig,
     pub local: LocalConfig,
+    /// Local MCP servers usable with tool consultations (`[[connectors]]`).
+    pub connectors: Vec<ConnectorConfig>,
 }
 impl Default for Config {
     fn default() -> Self {
@@ -78,6 +94,7 @@ impl Default for Config {
             max_context_chars: 64000,
             api: ApiConfig::default(),
             local: LocalConfig::default(),
+            connectors: Vec::new(),
         }
     }
 }
@@ -98,6 +115,15 @@ impl Config {
         }
         if !(1..=4_000_000).contains(&c.max_context_chars) {
             return Err("max_context_chars は1〜4000000です".into());
+        }
+        for (index, connector) in c.connectors.iter().enumerate() {
+            connector.validate()?;
+            if c.connectors[..index]
+                .iter()
+                .any(|other| other.name == connector.name)
+            {
+                return Err(format!("コネクター「{}」が重複しています", connector.name));
+            }
         }
         Ok(c)
     }
