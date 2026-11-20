@@ -57,7 +57,7 @@ These tokens live in `crates/codebot-gui/src/main.rs`. The UI has no decorative 
 
 ## Chat tools, search and suggestions
 
-- With an API destination, the composer row offers ツールを使う per chat. Sending then runs the tool engine inline below the messages in an outlined card (title, end action, replies, the existing command/change/connector review UI, result confirmation). The final answer is added as a normal assistant message.
+- Send settings (会話履歴を含める, ツールを使う with an API destination, 送信用の履歴を消去 with the history size) live at the top of the composer's add (＋) menu, not in a row below the composer; below the composer only the one-line destination notice and the context meter remain. While on, 会話履歴を含める and ツールを使う show as chips above the composer (kind 送信) and pressing a chip turns the setting off. Sending then runs the tool engine inline below the messages in an outlined card (title, end action, replies, the existing command/change/connector review UI, result confirmation). The final answer is added as a normal assistant message.
 - Above the composer, files mentioned in the draft appear as chips (green dot, no close mark) that open the Files page around that line. Attached skills and connectors use chips with a close mark.
 - At 80% of the context budget, a one-line notice appears below the composer, with 古い履歴を外す when history is included.
 - Answers with a change proposal show a collapsible inline diff (diff colors from the theme).

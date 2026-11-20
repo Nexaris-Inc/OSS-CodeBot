@@ -1264,13 +1264,34 @@ impl App {
     }
     /// Chips for skills and connectors attached to this chat.
     fn attached_chips(&mut self, ui: &mut egui::Ui) {
+        let history_on = self.history_chip_shown();
+        let tools_on = self.tools_chip_shown();
+        let busy = self.pending.is_some() || self.chat_tool.is_some();
         let session = &mut self.sessions[self.active];
-        if session.skills.is_empty() && session.connectors.is_empty() {
+        if session.skills.is_empty() && session.connectors.is_empty() && !history_on && !tools_on {
             return;
         }
         let mut remove_skill = None;
         let mut remove_connector = None;
         ui.horizontal_wrapped(|ui| {
+            // Send settings stay visible while on; pressing a chip turns it off.
+            if history_on
+                && chip(ui, "送信", "会話履歴を含める", context_bar::HISTORY(), true)
+                    .on_hover_text("過去の会話も送信します。押すとオフにします（「＋」メニューでも切り替え可）")
+                    .clicked()
+                && !busy
+            {
+                session.history_enabled = false;
+            }
+            if tools_on
+                && chip(ui, "送信", "ツールを使う", context_bar::TOOLS(), true)
+                    .on_hover_text("変更案・コマンド・コネクターのツールをAIが提案します。押すとオフにします")
+                    .clicked()
+                && !busy
+            {
+                session.use_tools = false;
+                self.sessions_dirty = true;
+            }
             for name in &session.skills {
                 if chip(ui, "スキル", name, context_bar::SKILLS(), true)
                     .on_hover_text("送信時にスキルの指示を依頼の前に付けます")
@@ -1281,7 +1302,7 @@ impl App {
             }
             for name in &session.connectors {
                 if chip(ui, "コネクター", name, context_bar::TOOLS(), true)
-                    .on_hover_text("「実行 → AIに作業を相談」でツールをAIに提示します")
+                    .on_hover_text("「ツールを使う」がオンのチャットと「AIに作業を相談」で、ツールをAIに提示します")
                     .clicked()
                 {
                     remove_connector = Some(name.clone());
@@ -1298,7 +1319,13 @@ impl App {
         }
         ui.add_space(4.0);
     }
-    /// Popup from the composer's add button: toggle library items for this chat.
+    fn history_chip_shown(&self) -> bool {
+        self.backend != Backend::Rules && self.sessions[self.active].history_enabled
+    }
+    fn tools_chip_shown(&self) -> bool {
+        self.tools_available() && self.sessions[self.active].use_tools
+    }
+    /// Popup from the composer's add button: send settings and library items for this chat.
     fn attach_menu(&mut self, ui: &mut egui::Ui, button: &egui::Response) {
         let id = ui.make_persistent_id(("attach-menu", self.active));
         if button.clicked() {
@@ -1308,6 +1335,11 @@ impl App {
         }
         let above = !self.sessions[self.active].messages.is_empty();
         let mut open_library = false;
+        let destination = self.destination_key();
+        let rules = self.backend == Backend::Rules;
+        let tools_available = self.tools_available();
+        let pending = self.pending.is_some();
+        let tool_running = self.chat_tool.is_some();
         egui::popup::popup_above_or_below_widget(
             ui,
             id,
@@ -1321,6 +1353,54 @@ impl App {
             |ui| {
                 ui.set_min_width(260.0);
                 let session = &mut self.sessions[self.active];
+                if !rules {
+                    ui.label(RichText::new("送信の設定").size(12.0).color(MUTED()));
+                    if ui
+                        .add_enabled(
+                            !pending,
+                            checkbox::Checkbox::new(
+                                &mut session.history_enabled,
+                                "会話履歴を含める",
+                            ),
+                        )
+                        .on_hover_text(
+                            "この送信先へ過去の会話も送ります。送信先を変えると再確認します",
+                        )
+                        .changed()
+                        && session.history_enabled
+                    {
+                        session.context_key = Some(destination.clone());
+                        session.notice = None;
+                    }
+                    if tools_available
+                        && ui
+                            .add_enabled(
+                                !pending && !tool_running,
+                                checkbox::Checkbox::new(&mut session.use_tools, "ツールを使う"),
+                            )
+                            .on_hover_text("変更案・コマンド・追加したコネクターのツールをAIが提案します。実行前と結果送信前に確認します。作業フォルダが必要です")
+                            .changed()
+                    {
+                        self.sessions_dirty = true;
+                    }
+                    let history = history_chars(&session.history);
+                    if ui
+                        .add_enabled(
+                            !pending && history > 0,
+                            egui::Button::new(format!("送信用の履歴を消去（{history}文字）")),
+                        )
+                        .on_hover_text("画面の会話と下書きは残ります")
+                        .clicked()
+                    {
+                        session.history.clear();
+                        session.notice = Some(
+                            "送信用の履歴を消去しました。画面の会話と下書きは保持しています。"
+                                .into(),
+                        );
+                        self.sessions_dirty = true;
+                    }
+                    ui.separator();
+                }
                 ui.label(RichText::new("スキル").size(12.0).color(MUTED()));
                 if self.library_panel.skills.is_empty() {
                     ui.label(
@@ -1555,61 +1635,6 @@ impl App {
                 } else if !session.attachments.is_empty() {
                     ui.label(RichText::new("添付する行の範囲を狭めると減らせます。").size(12.0).color(MUTED()));
                 }
-            });
-        }
-        if self.backend != Backend::Rules {
-            let destination = self.destination_key();
-            ui.horizontal(|ui| {
-                let session = &mut self.sessions[self.active];
-                if ui
-                    .add_enabled(
-                        self.pending.is_none(),
-                        crate::checkbox::Checkbox::new(
-                            &mut session.history_enabled,
-                            "会話履歴を含める",
-                        ),
-                    )
-                    .changed()
-                    && session.history_enabled
-                {
-                    session.context_key = Some(destination);
-                    session.notice = None;
-                }
-                if !matches!(self.backend, Backend::Local)
-                    && ui
-                        .add_enabled(
-                            self.pending.is_none() && self.chat_tool.is_none(),
-                            crate::checkbox::Checkbox::new(&mut session.use_tools, "ツールを使う"),
-                        )
-                        .on_hover_text("変更案・コマンド・追加したコネクターのツールをAIが提案します。実行前と結果送信前に確認します。作業フォルダが必要です。")
-                        .changed()
-                {
-                    self.sessions_dirty = true;
-                }
-                if ui
-                    .add_enabled(
-                        self.pending.is_none(),
-                        egui::Button::new("送信用の履歴を消去"),
-                    )
-                    .clicked()
-                {
-                    session.history.clear();
-                    session.notice = Some(
-                        "送信用の履歴を消去しました。画面の会話と下書きは保持しています。".into(),
-                    );
-                }
-                ui.label(
-                    RichText::new(format!(
-                        "{}文字",
-                        session
-                            .history
-                            .iter()
-                            .map(|m| m.content.chars().count())
-                            .sum::<usize>()
-                    ))
-                    .size(12.0)
-                    .color(MUTED()),
-                );
             });
         }
         if let Some(notice) = &self.sessions[self.active].notice {
@@ -2455,11 +2480,7 @@ impl eframe::App for App {
                             self.composer(ui);
                         });
                     } else {
-                        let extra = if self.backend == Backend::Rules {
-                            0.0
-                        } else {
-                            40.0
-                        } + if self.sessions[self.active].notice.is_some() {
+                        let extra = if self.sessions[self.active].notice.is_some() {
                             80.0
                         } else {
                             0.0
@@ -2467,7 +2488,15 @@ impl eframe::App for App {
                         let extra = extra + self.sessions[self.active].attachments.len() as f32 * 26.0;
                         let session = &self.sessions[self.active];
                         let extra = extra
-                            + if session.skills.is_empty() && session.connectors.is_empty() { 0.0 } else { 40.0 }
+                            + if session.skills.is_empty()
+                                && session.connectors.is_empty()
+                                && !self.history_chip_shown()
+                                && !self.tools_chip_shown()
+                            {
+                                0.0
+                            } else {
+                                40.0
+                            }
                             + if self.context_warning().is_some() { 36.0 } else { 0.0 }
                             + if self.mentioned_files().is_empty() { 0.0 } else { 40.0 };
                         let composer_top =
